@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <wire/wire.h>
 #include <wire/wire_io.h>
+#include <signal.h>
 
 /* A single request/response for subdaemon. */
 struct subdaemon_req {

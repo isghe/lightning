@@ -292,6 +292,13 @@ struct act_one {
 /* BOLT #8: The handshake message is _exactly_ `50 bytes` */
 #define ACT_ONE_SIZE 50 /* ARM's stupid ABI adds padding. */
 
+#ifdef IG_REMOVE_UNUSED
+#error "IG_REMOVE_UNUSED already defined"
+#endif
+
+#define IG_REMOVE_UNUSED 0
+
+#if IG_REMOVE_UNUSED
 static inline void check_act_one(const struct act_one *act1)
 {
 	/* BOLT #8:
@@ -304,6 +311,7 @@ static inline void check_act_one(const struct act_one *act1)
 	BUILD_ASSERT(sizeof(act1->pubkey) == 33);
 	BUILD_ASSERT(sizeof(act1->tag) == 16);
 }
+#endif
 
 static void act_one_initiator(struct handshake *h, int fd,
 			      const struct pubkey *their_id)
@@ -504,6 +512,8 @@ struct act_two {
 /* BOLT #8: The handshake is _exactly_ `50 bytes:` */
 #define ACT_TWO_SIZE 50 /* ARM's stupid ABI adds padding. */
 
+#if IG_REMOVE_UNUSED
+
 static inline void check_act_two(const struct act_two *act2)
 {
 	/* BOLT #8:
@@ -515,6 +525,7 @@ static inline void check_act_two(const struct act_two *act2)
 	BUILD_ASSERT(sizeof(act2->pubkey) == 33);
 	BUILD_ASSERT(sizeof(act2->tag) == 16);
 }
+#endif
 
 static void act_two_responder(struct handshake *h, int fd,
 			      const struct pubkey *re)
@@ -712,6 +723,8 @@ struct act_three {
 /* BOLT #8: The handshake is _exactly_ `66 bytes` */
 #define ACT_THREE_SIZE 66 /* ARM's stupid ABI adds padding. */
 
+#if IG_REMOVE_UNUSED
+
 static inline void check_act_three(const struct act_three *act3)
 {
 	/* BOLT #8:
@@ -725,6 +738,7 @@ static inline void check_act_three(const struct act_three *act3)
 	BUILD_ASSERT(sizeof(act3->ciphertext) == 33 + 16);
 	BUILD_ASSERT(sizeof(act3->tag) == 16);
 }
+#endif
 
 static void act_three_initiator(struct handshake *h, int fd,
 				const struct pubkey *re,

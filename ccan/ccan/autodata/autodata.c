@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <string.h>
-
+#include <ccan/ptr_valid/ptr_valid.c>
 #if HAVE_SECTION_START_STOP
 void *autodata_get_section(void *start, void *stop, size_t *nump)
 {
