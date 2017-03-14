@@ -20,7 +20,7 @@
 #include <errno.h>
 #include <inttypes.h>
 
-#define BITCOIN_CLI "bitcoin-cli"
+#define BITCOIN_CLI "/Users/isghe/development/cryptocoin/bitcoin/src/bitcoin-cli"
 
 char *bitcoin_datadir;
 
@@ -31,7 +31,7 @@ static char **gather_args(struct lightningd_state *dstate,
 	char **args = tal_arr(ctx, char *, 3);
 
 	args[n++] = BITCOIN_CLI;
-	if (dstate->config.regtest)
+	if (dstate->config.regtest || true)
 		args[n++] = "-regtest=1";
 	else
 		args[n++] = tal_fmt(args, "-testnet=%u", dstate->testnet);
