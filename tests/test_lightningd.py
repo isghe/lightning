@@ -1428,7 +1428,44 @@ class LightningDTests(BaseLightningDTests):
         bitcoind.generate_block(5)
         sync_blockheight([l1])
 
-    @flaky
+    @unittest.skipIf(not DEVELOPER, "needs dev-rescan-outputs")
+    def test_closing_torture(self):
+        l1 = self.node_factory.get_node()
+        l2 = self.node_factory.get_node()
+
+        amount = 10**6
+        self.give_funds(l1, amount + 10**7)
+
+        # The range below of 15 is unsatisfactory.
+        # Before the fix was applied, 15 would often pass.
+        # However, increasing the number of tries would
+        # take longer in VALGRIND mode, triggering a CI
+        # failure since the test does not print any
+        # output.
+        for i in range(15):
+            # Reduce probability that spurious sendrawtx error will occur
+            l1.rpc.dev_rescan_outputs()
+
+            # Create a channel.
+            l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+            l1.rpc.fundchannel(l2.info['id'], amount)
+            l1.daemon.wait_for_log('sendrawtx exit 0')
+            # Get it confirmed.
+            l1.bitcoin.generate_block(6)
+            # Wait for it to go to CHANNELD_NORMAL
+            l1.daemon.wait_for_logs(['to CHANNELD_NORMAL'])
+            l2.daemon.wait_for_logs(['to CHANNELD_NORMAL'])
+
+            # Start closers.
+            c1 = self.executor.submit(l1.rpc.close, l2.info['id'])
+            c2 = self.executor.submit(l2.rpc.close, l1.info['id'])
+            # Wait for close to finish
+            c1.result(10)
+            c2.result(10)
+            l1.daemon.wait_for_log('sendrawtx exit 0')
+            # Get close confirmed
+            l1.bitcoin.generate_block(100)
+
     def test_closing_different_fees(self):
         l1 = self.node_factory.get_node()
 
@@ -1545,7 +1582,7 @@ class LightningDTests(BaseLightningDTests):
         bitcoind.generate_block(95)
         wait_forget_channels(l1)
 
-        wait_for(lambda: l2.rpc.listpeers(l1.info['id'])['peers'][0]['channels'][0]['status'] == ['ONCHAIN:Tracking our own unilateral close', 'ONCHAIN:All outputs resolved: waiting 5 more blocks before forgetting channel'], timeout=1)
+        wait_for(lambda: l2.rpc.listpeers(l1.info['id'])['peers'][0]['channels'][0]['status'] == ['ONCHAIN:Tracking our own unilateral close', 'ONCHAIN:All outputs resolved: waiting 5 more blocks before forgetting channel'])
 
         # Now, 100 blocks l2 should be done.
         bitcoind.generate_block(5)
@@ -1654,7 +1691,6 @@ class LightningDTests(BaseLightningDTests):
         options = {'locktime-blocks': 201, 'cltv-delta': 101}
         l1 = self.node_factory.get_node(options=options, disconnect=disconnects)
         l2 = self.node_factory.get_node(options=options)
-        btc = l1.bitcoin
 
         l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
         self.fund_channel(l1, l2, 10**6)
@@ -1668,7 +1704,7 @@ class LightningDTests(BaseLightningDTests):
         }
         l1.rpc.sendpay(to_json([routestep]), rhash)
         l1.daemon.wait_for_log(r'Disabling channel')
-        btc.rpc.generate(1)
+        bitcoind.rpc.generate(1)
 
         # Wait for nodes to notice the failure, this seach needle is after the
         # DB commit so we're sure the tx entries in onchaindtxs have been added
@@ -1681,7 +1717,7 @@ class LightningDTests(BaseLightningDTests):
 
         # Generate some blocks so we restart the onchaind from DB (we rescan
         # last_height - 100)
-        btc.rpc.generate(100)
+        bitcoind.rpc.generate(100)
         sync_blockheight([l1, l2])
 
         # l1 should still have a running onchaind
@@ -1696,7 +1732,7 @@ class LightningDTests(BaseLightningDTests):
         # l1 should still notice that the funding was spent and that we should react to it
         l1.daemon.wait_for_log("Propose handling OUR_UNILATERAL/DELAYED_OUTPUT_TO_US by OUR_DELAYED_RETURN_TO_WALLET")
         sync_blockheight([l1])
-        btc.rpc.generate(10)
+        bitcoind.rpc.generate(10)
         sync_blockheight([l1])
 
     @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
@@ -4470,12 +4506,12 @@ class LightningDTests(BaseLightningDTests):
         assert l1.rpc.listnodes()['nodes'] == []
         assert l2.rpc.listnodes()['nodes'] == []
 
+    @flaky
     @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
     def test_blockchaintrack(self):
         """Check that we track the blockchain correctly across reorgs
         """
-        l1 = self.node_factory.get_node()
-        btc = l1.bitcoin
+        l1 = self.node_factory.get_node(random_hsm=True)
         addr = l1.rpc.newaddr()['address']
 
         ######################################################################
@@ -4483,11 +4519,13 @@ class LightningDTests(BaseLightningDTests):
         # and we try to add a block twice when rescanning:
         l1.restart()
 
+        height = bitcoind.rpc.getblockcount()
+
         # At height 111 we receive an incoming payment
-        hashes = btc.rpc.generate(9)
-        btc.rpc.sendtoaddress(addr, 1)
+        hashes = bitcoind.rpc.generate(9)
+        bitcoind.rpc.sendtoaddress(addr, 1)
         time.sleep(1)  # mempool is still unpredictable
-        btc.rpc.generate(1)
+        bitcoind.rpc.generate(1)
 
         l1.daemon.wait_for_log(r'Owning')
         outputs = l1.rpc.listfunds()['outputs']
@@ -4495,18 +4533,18 @@ class LightningDTests(BaseLightningDTests):
 
         ######################################################################
         # Second failure scenario: perform a 20 block reorg
-        btc.rpc.generate(10)
-        btc.rpc.getblockcount()
-        l1.daemon.wait_for_log(r'Adding block 121: [a-f0-9]{32}')
+        bitcoind.rpc.generate(10)
+        l1.daemon.wait_for_log('Adding block {}: '.format(height + 20))
 
         # Now reorg out with a longer fork of 21 blocks
-        btc.rpc.invalidateblock(hashes[0])
-        btc.wait_for_log(r'InvalidChainFound: invalid block=.*  height=102')
-        hashes = btc.rpc.generate(30)
+        bitcoind.rpc.invalidateblock(hashes[0])
+        bitcoind.wait_for_log(r'InvalidChainFound: invalid block=.*  height={}'
+                              .format(height + 1))
+        hashes = bitcoind.rpc.generate(30)
         time.sleep(1)
 
-        btc.rpc.getblockcount()
-        l1.daemon.wait_for_log(r'Adding block 131: [a-f0-9]{32}')
+        bitcoind.rpc.getblockcount()
+        l1.daemon.wait_for_log('Adding block {}: '.format(height + 30))
 
         # Our funds got reorged out, we should not have any funds that are confirmed
         assert [o for o in l1.rpc.listfunds()['outputs'] if o['status'] != "unconfirmed"] == []
@@ -4547,7 +4585,6 @@ class LightningDTests(BaseLightningDTests):
         """Test the rescan option
         """
         l1 = self.node_factory.get_node()
-        btc = l1.bitcoin
 
         # The first start should start at current_height - 30 = 71, make sure
         # it's not earlier
@@ -4572,7 +4609,7 @@ class LightningDTests(BaseLightningDTests):
         # the current height
         l1.daemon.opts['rescan'] = -500000
         l1.stop()
-        btc.rpc.generate(4)
+        bitcoind.rpc.generate(4)
         l1.start()
         l1.daemon.wait_for_log(r'Adding block 105')
         assert not l1.daemon.is_in_log(r'Adding block 102')
