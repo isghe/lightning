@@ -33,9 +33,12 @@
 #include <fcntl.h>
 #include <gossipd/broadcast.h>
 #include <gossipd/gen_gossip_wire.h>
+#include <gossipd/gossip.h>
 #include <gossipd/handshake.h>
 #include <gossipd/netaddress.h>
 #include <gossipd/routing.h>
+#include <gossipd/tor.h>
+#include <gossipd/tor_autoservice.h>
 #include <hsmd/client.h>
 #include <hsmd/gen_hsm_client_wire.h>
 #include <inttypes.h>
@@ -52,6 +55,8 @@
 #include <wire/gen_peer_wire.h>
 #include <wire/wire_io.h>
 #include <wire/wire_sync.h>
+
+#define GOSSIP_MAX_REACH_ATTEMPTS 10
 
 #define HSM_FD 3
 
@@ -142,6 +147,11 @@ struct daemon {
 
 	/* Automatically reconnect. */
 	bool reconnect;
+
+	struct addrinfo *proxyaddr;
+	bool use_proxy_always;
+	char *tor_password;
+
 };
 
 /* Peers we're trying to reach. */
@@ -463,8 +473,9 @@ static struct io_plan *peer_connected(struct io_conn *conn, struct peer *peer)
 			add_reconnecting_peer(peer->daemon, peer);
 			return io_wait(conn, peer, retry_peer_connected, peer);
 		}
-		/* Local peers can just be discarded when they reconnect */
-		tal_free(old_peer);
+		/* Local peers can just be discarded when they reconnect:
+		 * closing conn will free peer. */
+		io_close(old_peer->local->conn);
 	}
 
 	reached_peer(peer, conn);
@@ -646,7 +657,7 @@ static u8 *handle_gossip_msg(struct daemon *daemon, const u8 *msg)
 		break;
 
 	case WIRE_CHANNEL_UPDATE:
-		err = handle_channel_update(rstate, msg);
+		err = handle_channel_update(rstate, msg, true);
 		if (err)
 			return err;
 		break;
@@ -891,15 +902,11 @@ static void handle_get_update(struct peer *peer, const u8 *msg)
 					      &scid));
 		update = NULL;
 	} else {
-		/* We want update that comes from our end. */
+		/* We want the update that comes from our end. */
 		if (pubkey_eq(&chan->nodes[0]->id, &peer->daemon->id))
-			update = get_broadcast(rstate->broadcasts,
-					       chan->half[0]
-					       .channel_update_msgidx);
+			update = chan->half[0].channel_update;
 		else if (pubkey_eq(&chan->nodes[1]->id, &peer->daemon->id))
-			update = get_broadcast(rstate->broadcasts,
-					       chan->half[1]
-					       .channel_update_msgidx);
+			update = chan->half[1].channel_update;
 		else {
 			status_unusual("peer %s scid %s: not our channel?",
 				       type_to_string(tmpctx, struct pubkey,
@@ -1239,11 +1246,7 @@ static void append_half_channel(struct gossip_getchannels_entry **entries,
 	struct gossip_getchannels_entry *e;
 	size_t n;
 
-	if (!c)
-		return;
-
-	/* Don't mention non-public inactive channels. */
-	if (!c->active && !c->channel_update_msgidx)
+	if (!is_halfchan_defined(c))
 		return;
 
 	n = tal_count(*entries);
@@ -1253,16 +1256,13 @@ static void append_half_channel(struct gossip_getchannels_entry **entries,
 	e->source = chan->nodes[idx]->id;
 	e->destination = chan->nodes[!idx]->id;
 	e->satoshis = chan->satoshis;
-	e->active = c->active;
 	e->flags = c->flags;
-	e->public = chan->public && (c->channel_update_msgidx != 0);
+	e->public = is_chan_public(chan);
 	e->short_channel_id = chan->scid;
-	e->last_update_timestamp = c->channel_update_msgidx ? c->last_timestamp : -1;
-	if (e->last_update_timestamp >= 0) {
-		e->base_fee_msat = c->base_fee;
-		e->fee_per_millionth = c->proportional_fee;
-		e->delay = c->delay;
-	}
+	e->last_update_timestamp = c->last_timestamp;
+	e->base_fee_msat = c->base_fee;
+	e->fee_per_millionth = c->proportional_fee;
+	e->delay = c->delay;
 }
 
 static void append_channel(struct gossip_getchannels_entry **entries,
@@ -1448,14 +1448,10 @@ static void gossip_send_keepalive_update(struct routing_state *rstate,
 	u64 htlc_minimum_msat;
 	u16 flags, cltv_expiry_delta;
 	u8 *update, *msg, *err;
-	const u8 *old_update;
 
 	/* Parse old update */
-	old_update = get_broadcast(rstate->broadcasts,
-				   hc->channel_update_msgidx);
-
 	if (!fromwire_channel_update(
-		old_update, &sig, &chain_hash, &scid, &timestamp,
+		hc->channel_update, &sig, &chain_hash, &scid, &timestamp,
 		&flags, &cltv_expiry_delta, &htlc_minimum_msat, &fee_base_msat,
 		&fee_proportional_millionths)) {
 		status_failed(
@@ -1486,7 +1482,7 @@ static void gossip_send_keepalive_update(struct routing_state *rstate,
 	status_trace("Sending keepalive channel_update for %s",
 		     type_to_string(tmpctx, struct short_channel_id, &scid));
 
-	err = handle_channel_update(rstate, update);
+	err = handle_channel_update(rstate, update, true);
 	if (err)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "rejected keepalive channel_update: %s",
@@ -1513,8 +1509,8 @@ static void gossip_refresh_network(struct daemon *daemon)
 		for (size_t i = 0; i < tal_count(n->chans); i++) {
 			struct half_chan *hc = half_chan_from(n, n->chans[i]);
 
-			if (!hc->channel_update_msgidx) {
-				/* Connection is not public yet, so don't even
+			if (!is_halfchan_defined(hc)) {
+				/* Connection is not announced yet, so don't even
 				 * try to re-announce it */
 				continue;
 			}
@@ -1524,7 +1520,7 @@ static void gossip_refresh_network(struct daemon *daemon)
 				continue;
 			}
 
-			if (!hc->active) {
+			if (!is_halfchan_enabled(hc)) {
 				/* Only send keepalives for active connections */
 				continue;
 			}
@@ -1605,6 +1601,8 @@ static bool handle_wireaddr_listen(struct daemon *daemon,
 		}
 		return false;
 	case ADDR_TYPE_PADDING:
+	case ADDR_TYPE_TOR_V2:
+	case ADDR_TYPE_TOR_V3:
 		break;
 	}
 	status_failed(STATUS_FAIL_INTERNAL_ERROR,
@@ -1674,6 +1672,9 @@ static struct wireaddr_internal *setup_listeners(const tal_t *ctx,
 			/* We don't announce socket names */
 			add_binding(&binding, &wa);
 			continue;
+		case ADDR_INTERNAL_AUTOTOR:
+			/* We handle these after we have all bindings. */
+			continue;
 		case ADDR_INTERNAL_ALLPROTO: {
 			bool ipv6_ok;
 
@@ -1710,6 +1711,8 @@ static struct wireaddr_internal *setup_listeners(const tal_t *ctx,
 			if (public_address(daemon, &wa.u.wireaddr))
 				add_announcable(daemon, &wa.u.wireaddr);
 			continue;
+		case ADDR_INTERNAL_FORPROXY:
+			break;
 		}
 		/* Shouldn't happen. */
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
@@ -1717,6 +1720,20 @@ static struct wireaddr_internal *setup_listeners(const tal_t *ctx,
 			      daemon->proposed_wireaddr[i].itype);
 	}
 
+	/* Now we have bindings, set up any Tor auto addresses */
+	for (size_t i = 0; i < tal_count(daemon->proposed_wireaddr); i++) {
+		if (!(daemon->proposed_listen_announce[i] & ADDR_LISTEN))
+			continue;
+
+		if (daemon->proposed_wireaddr[i].itype != ADDR_INTERNAL_AUTOTOR)
+			continue;
+
+		add_announcable(daemon,
+				tor_autoservice(tmpctx,
+						&daemon->proposed_wireaddr[i].u.torservice,
+						daemon->tor_password,
+						binding));
+	}
 	return binding;
 }
 
@@ -1730,6 +1747,7 @@ static struct io_plan *gossip_init(struct daemon_conn *master,
 	struct bitcoin_blkid chain_hash;
 	u32 update_channel_interval;
 	bool dev_allow_localhost;
+	struct wireaddr *proxyaddr;
 
 	if (!fromwire_gossipctl_init(
 		daemon, msg, &daemon->broadcast_interval, &chain_hash,
@@ -1737,13 +1755,23 @@ static struct io_plan *gossip_init(struct daemon_conn *master,
 		&daemon->localfeatures, &daemon->proposed_wireaddr,
 		&daemon->proposed_listen_announce, daemon->rgb,
 		daemon->alias, &update_channel_interval, &daemon->reconnect,
-		&dev_allow_localhost)) {
+		&proxyaddr, &daemon->use_proxy_always,
+		&dev_allow_localhost,
+		&daemon->tor_password)) {
 		master_badmsg(WIRE_GOSSIPCTL_INIT, msg);
 	}
 	/* Prune time is twice update time */
 	daemon->rstate = new_routing_state(daemon, &chain_hash, &daemon->id,
 					   update_channel_interval * 2,
 					   dev_allow_localhost);
+
+	/* Resolve Tor proxy address if any */
+	if (proxyaddr) {
+		status_trace("Proxy address: %s",
+			     fmt_wireaddr(tmpctx, proxyaddr));
+		daemon->proxyaddr = wireaddr_to_addrinfo(daemon, proxyaddr);
+	} else
+		daemon->proxyaddr = NULL;
 
 	/* Load stored gossip messages */
 	gossip_store_load(daemon->rstate, daemon->rstate->store);
@@ -1819,8 +1847,7 @@ static struct io_plan *handshake_out_success(struct io_conn *conn,
 }
 
 
-static struct io_plan *connection_out(struct io_conn *conn,
-				      struct reaching *reach)
+struct io_plan *connection_out(struct io_conn *conn, struct reaching *reach)
 {
 	/* FIXME: Timeout */
 	status_trace("Connected out for %s",
@@ -1872,82 +1899,102 @@ static void connect_failed(struct io_conn *conn, struct reaching *reach)
 
 static struct io_plan *conn_init(struct io_conn *conn, struct reaching *reach)
 {
-	struct addrinfo ai;
-	struct sockaddr_in sin;
-	struct sockaddr_in6 sin6;
-	struct sockaddr_un sun;
-
-	/* FIXME: make generic */
-	ai.ai_flags = 0;
-	ai.ai_socktype = SOCK_STREAM;
-	ai.ai_protocol = 0;
-	ai.ai_canonname = NULL;
-	ai.ai_next = NULL;
+	struct addrinfo *ai = NULL;
 
 	switch (reach->addr.itype) {
 	case ADDR_INTERNAL_SOCKNAME:
-		wireaddr_to_sockname(&reach->addr, &sun);
-		ai.ai_family = sun.sun_family;
-		ai.ai_addrlen = sizeof(sin);
-		ai.ai_addr = (struct sockaddr *)&sun;
+		ai = wireaddr_internal_to_addrinfo(tmpctx, &reach->addr);
 		break;
 	case ADDR_INTERNAL_ALLPROTO:
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Can't reach to all protocols");
 		break;
+	case ADDR_INTERNAL_AUTOTOR:
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Can't reach to autotor address");
+		break;
+	case ADDR_INTERNAL_FORPROXY:
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Can't reach to forproxy address");
+		break;
 	case ADDR_INTERNAL_WIREADDR:
-		switch (reach->addr.u.wireaddr.type) {
-		case ADDR_TYPE_IPV4:
-			wireaddr_to_ipv4(&reach->addr.u.wireaddr, &sin);
-			ai.ai_family = sin.sin_family;
-			ai.ai_addrlen = sizeof(sin);
-			ai.ai_addr = (struct sockaddr *)&sin;
-			break;
-		case ADDR_TYPE_IPV6:
-			wireaddr_to_ipv6(&reach->addr.u.wireaddr, &sin6);
-			ai.ai_family = sin6.sin6_family;
-			ai.ai_addrlen = sizeof(sin6);
-			ai.ai_addr = (struct sockaddr *)&sin6;
-			break;
-		case ADDR_TYPE_PADDING:
-			/* Shouldn't happen. */
-			return io_close(conn);
-		}
+		/* If it was a Tor address, we wouldn't be here. */
+		ai = wireaddr_to_addrinfo(tmpctx, &reach->addr.u.wireaddr);
+		break;
 	}
+	assert(ai);
+
 	io_set_finish(conn, connect_failed, reach);
-	return io_connect(conn, &ai, connection_out, reach);
+	return io_connect(conn, ai, connection_out, reach);
 }
 
-static struct addrhint *
-seed_resolve_addr(const tal_t *ctx, const struct pubkey *id, const u16 port)
+static struct io_plan *conn_proxy_init(struct io_conn *conn,
+				       struct reaching *reach)
 {
-	struct addrhint *a;
-	char bech32[100], *addr;
+	char *host = NULL;
+	u16 port;
+
+	switch (reach->addr.itype) {
+	case ADDR_INTERNAL_FORPROXY:
+		host = reach->addr.u.unresolved.name;
+		port = reach->addr.u.unresolved.port;
+		break;
+	case ADDR_INTERNAL_WIREADDR:
+		host = fmt_wireaddr_without_port(tmpctx,
+						 &reach->addr.u.wireaddr);
+		port = reach->addr.u.wireaddr.port;
+		break;
+	case ADDR_INTERNAL_SOCKNAME:
+	case ADDR_INTERNAL_ALLPROTO:
+	case ADDR_INTERNAL_AUTOTOR:
+		break;
+	}
+
+	if (!host)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Can't reach to %u address", reach->addr.itype);
+
+	io_set_finish(conn, connect_failed, reach);
+	return io_tor_connect(conn, reach->daemon->proxyaddr, host, port, reach);
+}
+
+static const char *seedname(const tal_t *ctx, const struct pubkey *id)
+{
+	char bech32[100];
 	u8 der[PUBKEY_DER_LEN];
 	u5 *data = tal_arr(ctx, u5, 0);
 
 	pubkey_to_der(der, id);
 	bech32_push_bits(&data, der, PUBKEY_DER_LEN*8);
 	bech32_encode(bech32, "ln", data, tal_count(data), sizeof(bech32));
-	addr = tal_fmt(ctx, "%s.lseed.bitcoinstats.com", bech32);
+	return tal_fmt(ctx, "%s.lseed.bitcoinstats.com", bech32);
+}
 
+static struct wireaddr_internal *
+seed_resolve_addr(const tal_t *ctx, const struct pubkey *id)
+{
+	struct wireaddr_internal *a;
+	const char *addr;
+
+	addr = seedname(tmpctx, id);
 	status_trace("Resolving %s", addr);
 
-	a = tal(ctx, struct addrhint);
-	a->addr.itype = ADDR_INTERNAL_WIREADDR;
-	if (!wireaddr_from_hostname(&a->addr.u.wireaddr, addr, port, NULL)) {
+	a = tal(ctx, struct wireaddr_internal);
+	a->itype = ADDR_INTERNAL_WIREADDR;
+	if (!wireaddr_from_hostname(&a->u.wireaddr, addr, DEFAULT_PORT, NULL,
+				    NULL)) {
 		status_trace("Could not resolve %s", addr);
 		return tal_free(a);
 	} else {
 		status_trace("Resolved %s to %s", addr,
 			     type_to_string(ctx, struct wireaddr,
-					    &a->addr.u.wireaddr));
+					    &a->u.wireaddr));
 		return a;
 	}
 }
 
 /* Resolve using gossiped wireaddr stored in routemap. */
-static struct addrhint *
+static struct wireaddr_internal *
 gossip_resolve_addr(const tal_t *ctx,
 		    struct routing_state *rstate,
 		    const struct pubkey *id)
@@ -1964,15 +2011,15 @@ gossip_resolve_addr(const tal_t *ctx,
 	/* FIXME: When struct addrhint can contain more than one address,
 	 * we should copy all routable addresses. */
 	for (size_t i = 0; i < tal_count(node->addresses); i++) {
-		struct addrhint *a;
+		struct wireaddr_internal *a;
 
 		if (!address_routable(&node->addresses[i],
 				      rstate->dev_allow_localhost))
 			continue;
 
-		a = tal(ctx, struct addrhint);
-		a->addr.itype = ADDR_INTERNAL_WIREADDR;
-		a->addr.u.wireaddr = node->addresses[i];
+		a = tal(ctx, struct wireaddr_internal);
+		a->itype = ADDR_INTERNAL_WIREADDR;
+		a->u.wireaddr = node->addresses[i];
 		return a;
 	}
 
@@ -1982,10 +2029,12 @@ gossip_resolve_addr(const tal_t *ctx,
 static void try_reach_peer(struct daemon *daemon, const struct pubkey *id,
 			   bool master_needs_response)
 {
-	struct addrhint *a;
+	struct wireaddr_internal *a;
+	struct addrhint *hint;
 	int fd, af;
 	struct reaching *reach;
 	u8 *msg;
+	bool use_proxy = daemon->use_proxy_always;
 	struct peer *peer = find_peer(daemon, id);
 
 	if (peer) {
@@ -2013,15 +2062,27 @@ static void try_reach_peer(struct daemon *daemon, const struct pubkey *id,
 		return;
 	}
 
-	a = find_addrhint(daemon, id);
+	hint = find_addrhint(daemon, id);
+	if (hint)
+		a = &hint->addr;
+	else
+		a = NULL;
 
 	if (!a)
 		a = gossip_resolve_addr(tmpctx,
 					daemon->rstate,
 					id);
 
-	if (!a)
-		a = seed_resolve_addr(tmpctx, id, 9735);
+	if (!a) {
+		/* Don't resolve via DNS seed if we're supposed to use proxy. */
+		if (use_proxy) {
+			a = tal(tmpctx, struct wireaddr_internal);
+			wireaddr_from_unresolved(a, seedname(tmpctx, id),
+						 DEFAULT_PORT);
+		} else {
+			a = seed_resolve_addr(tmpctx, id);
+		}
+	}
 
 	if (!a) {
 		status_debug("No address known for %s, giving up",
@@ -2037,15 +2098,28 @@ static void try_reach_peer(struct daemon *daemon, const struct pubkey *id,
 
 	/* Might not even be able to create eg. IPv6 sockets */
 	af = -1;
-	switch (a->addr.itype) {
+
+	switch (a->itype) {
 	case ADDR_INTERNAL_SOCKNAME:
 		af = AF_LOCAL;
+		/* Local sockets don't use tor proxy */
+		use_proxy = false;
 		break;
 	case ADDR_INTERNAL_ALLPROTO:
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Can't reach ALLPROTO");
+	case ADDR_INTERNAL_AUTOTOR:
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Can't reach AUTOTOR");
+	case ADDR_INTERNAL_FORPROXY:
+		use_proxy = true;
+		break;
 	case ADDR_INTERNAL_WIREADDR:
-		switch (a->addr.u.wireaddr.type) {
+		switch (a->u.wireaddr.type) {
+		case ADDR_TYPE_TOR_V2:
+		case ADDR_TYPE_TOR_V3:
+			use_proxy = true;
+			break;
 		case ADDR_TYPE_IPV4:
 			af = AF_INET;
 			break;
@@ -2056,6 +2130,16 @@ static void try_reach_peer(struct daemon *daemon, const struct pubkey *id,
 			break;
 		}
 	}
+
+	/* If we have to use proxy but we don't have one, we fail. */
+	if (use_proxy) {
+		if (!daemon->proxyaddr) {
+			status_debug("Need proxy");
+			af = -1;
+		} else
+			af = daemon->proxyaddr->ai_family;
+	}
+
 	if (af == -1) {
 		fd = -1;
 		errno = EPROTONOSUPPORT;
@@ -2081,13 +2165,16 @@ static void try_reach_peer(struct daemon *daemon, const struct pubkey *id,
 	reach = tal(daemon, struct reaching);
 	reach->daemon = daemon;
 	reach->id = *id;
-	reach->addr = a->addr;
+	reach->addr = *a;
 	reach->master_needs_response = master_needs_response;
 	reach->connstate = "Connection establishment";
 	list_add_tail(&daemon->reaching, &reach->list);
 	tal_add_destructor(reach, destroy_reaching);
 
-	io_new_conn(reach, fd, conn_init, reach);
+	if (use_proxy)
+		io_new_conn(reach, fd, conn_proxy_init, reach);
+	else
+		io_new_conn(reach, fd, conn_init, reach);
 }
 
 /* Called from timer, so needs single-arg declaration */
@@ -2271,7 +2358,6 @@ static struct io_plan *handle_disable_channel(struct io_conn *conn,
 	secp256k1_ecdsa_signature sig;
 	u64 htlc_minimum_msat;
 	u8 *err;
-	const u8 *old_update;
 
 	if (!fromwire_gossip_disable_channel(msg, &scid, &direction, &active) ) {
 		status_unusual("Unable to parse %s",
@@ -2290,11 +2376,9 @@ static struct io_plan *handle_disable_channel(struct io_conn *conn,
 
 	status_trace("Disabling channel %s/%d, active %d -> %d",
 		     type_to_string(msg, struct short_channel_id, &scid),
-		     direction, hc->active, active);
+		     direction, is_halfchan_enabled(hc), active);
 
-	hc->active = active;
-
-	if (!hc->channel_update_msgidx) {
+	if (!is_halfchan_defined(hc)) {
 		status_trace(
 		    "Channel %s/%d doesn't have a channel_update yet, can't "
 		    "disable",
@@ -2303,11 +2387,8 @@ static struct io_plan *handle_disable_channel(struct io_conn *conn,
 		goto fail;
 	}
 
-	old_update = get_broadcast(daemon->rstate->broadcasts,
-				   hc->channel_update_msgidx);
-
 	if (!fromwire_channel_update(
-		old_update, &sig, &chain_hash, &scid, &timestamp,
+		hc->channel_update, &sig, &chain_hash, &scid, &timestamp,
 		&flags, &cltv_expiry_delta, &htlc_minimum_msat, &fee_base_msat,
 		&fee_proportional_millionths)) {
 		status_failed(
@@ -2339,7 +2420,7 @@ static struct io_plan *handle_disable_channel(struct io_conn *conn,
 			      strerror(errno));
 	}
 
-	err = handle_channel_update(daemon->rstate, msg);
+	err = handle_channel_update(daemon->rstate, msg, true);
 	if (err)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "rejected disabling channel_update: %s",

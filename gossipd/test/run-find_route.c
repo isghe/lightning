@@ -25,7 +25,7 @@ bool fromwire_channel_announcement(const tal_t *ctx UNNEEDED, const void *p UNNE
 bool fromwire_channel_update(const void *p UNNEEDED, secp256k1_ecdsa_signature *signature UNNEEDED, struct bitcoin_blkid *chain_hash UNNEEDED, struct short_channel_id *short_channel_id UNNEEDED, u32 *timestamp UNNEEDED, u16 *flags UNNEEDED, u16 *cltv_expiry_delta UNNEEDED, u64 *htlc_minimum_msat UNNEEDED, u32 *fee_base_msat UNNEEDED, u32 *fee_proportional_millionths UNNEEDED)
 { fprintf(stderr, "fromwire_channel_update called!\n"); abort(); }
 /* Generated stub for fromwire_gossip_local_add_channel */
-bool fromwire_gossip_local_add_channel(const void *p UNNEEDED, struct short_channel_id *short_channel_id UNNEEDED, struct bitcoin_blkid *chain_hash UNNEEDED, struct pubkey *remote_node_id UNNEEDED, u16 *cltv_expiry_delta UNNEEDED, u64 *htlc_minimum_msat UNNEEDED, u32 *fee_base_msat UNNEEDED, u32 *fee_proportional_millionths UNNEEDED)
+bool fromwire_gossip_local_add_channel(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct short_channel_id *short_channel_id UNNEEDED, struct pubkey *remote_node_id UNNEEDED, u8 **update UNNEEDED)
 { fprintf(stderr, "fromwire_gossip_local_add_channel called!\n"); abort(); }
 /* Generated stub for fromwire_gossip_store_channel_announcement */
 bool fromwire_gossip_store_channel_announcement(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u8 **announcement UNNEEDED, u64 *satoshis UNNEEDED)
@@ -51,15 +51,12 @@ u8 fromwire_u8(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 /* Generated stub for fromwire_wireaddr */
 bool fromwire_wireaddr(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct wireaddr *addr UNNEEDED)
 { fprintf(stderr, "fromwire_wireaddr called!\n"); abort(); }
+/* Generated stub for insert_broadcast */
+void insert_broadcast(struct broadcast_state *bstate UNNEEDED, const u8 *msg UNNEEDED)
+{ fprintf(stderr, "insert_broadcast called!\n"); abort(); }
 /* Generated stub for onion_type_name */
 const char *onion_type_name(int e UNNEEDED)
 { fprintf(stderr, "onion_type_name called!\n"); abort(); }
-/* Generated stub for replace_broadcast */
-bool replace_broadcast(const tal_t *ctx UNNEEDED,
-		       struct broadcast_state *bstate UNNEEDED,
-		       u64 *index UNNEEDED,
-		       const u8 *payload TAKES UNNEEDED)
-{ fprintf(stderr, "replace_broadcast called!\n"); abort(); }
 /* Generated stub for sanitize_error */
 char *sanitize_error(const tal_t *ctx UNNEEDED, const u8 *errmsg UNNEEDED,
 		     struct channel_id *channel_id UNNEEDED)
@@ -110,10 +107,11 @@ static struct half_chan *add_connection(struct routing_state *rstate,
 		chan = new_chan(rstate, &scid, from, to);
 
 	c = &chan->half[pubkey_idx(from, to)];
+	/* Make sure it's seen as initialized (update non-NULL). */
+	c->channel_update = (void *)c;
 	c->base_fee = base_fee;
 	c->proportional_fee = proportional_fee;
 	c->delay = delay;
-	c->active = true;
 	c->flags = get_channel_direction(from, to);
 	return c;
 }
@@ -245,7 +243,7 @@ int main(void)
 	assert(fee == 1 + 3);
 
 	/* Make B->C inactive, force it back via D */
-	get_connection(rstate, &b, &c)->active = false;
+	get_connection(rstate, &b, &c)->flags |= ROUTING_FLAGS_DISABLED;
 	route = find_route(tmpctx, rstate, &a, &c, 3000000, riskfactor, 0.0, NULL, &fee);
 	assert(route);
 	assert(tal_count(route) == 2);

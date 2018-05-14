@@ -139,6 +139,14 @@ void json_add_address(struct json_result *response, const char *fieldname,
 		json_add_string(response, "type", "ipv6");
 		json_add_string(response, "address", addrstr);
 		json_add_num(response, "port", addr->port);
+	} else if (addr->type == ADDR_TYPE_TOR_V2) {
+		json_add_string(response, "type", "torv2");
+		json_add_string(response, "address", fmt_wireaddr_without_port(tmpctx, addr));
+		json_add_num(response, "port", addr->port);
+	} else if (addr->type == ADDR_TYPE_TOR_V3) {
+		json_add_string(response, "type", "torv3");
+		json_add_string(response, "address", fmt_wireaddr_without_port(tmpctx, addr));
+		json_add_num(response, "port", addr->port);
 	}
 	json_object_end(response);
 }
@@ -158,6 +166,19 @@ void json_add_address_internal(struct json_result *response,
 		json_object_start(response, fieldname);
 		json_add_string(response, "type", "any protocol");
 		json_add_num(response, "port", addr->u.port);
+		json_object_end(response);
+		return;
+	case ADDR_INTERNAL_AUTOTOR:
+		json_object_start(response, fieldname);
+		json_add_string(response, "type", "Tor generated address");
+		json_add_address(response, "service", &addr->u.torservice);
+		json_object_end(response);
+		return;
+	case ADDR_INTERNAL_FORPROXY:
+		json_object_start(response, fieldname);
+		json_add_string(response, "type", "unresolved");
+		json_add_string(response, "name", addr->u.unresolved.name);
+		json_add_num(response, "port", addr->u.unresolved.port);
 		json_object_end(response);
 		return;
 	case ADDR_INTERNAL_WIREADDR:

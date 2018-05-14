@@ -147,7 +147,8 @@ static char *opt_set_s32(const char *arg, s32 *u)
 
 static char *opt_add_addr_withtype(const char *arg,
 				   struct lightningd *ld,
-				   enum addr_listen_announce ala)
+				   enum addr_listen_announce ala,
+				   bool wildcard_ok)
 {
 	size_t n = tal_count(ld->proposed_wireaddr);
 	char const *err_msg;
@@ -159,7 +160,8 @@ static char *opt_add_addr_withtype(const char *arg,
 	ld->proposed_listen_announce[n] = ala;
 
 	if (!parse_wireaddr_internal(arg, &ld->proposed_wireaddr[n], ld->portnum,
-				     true, &err_msg)) {
+				     wildcard_ok, !ld->use_proxy_always, false,
+				     &err_msg)) {
 		return tal_fmt(NULL, "Unable to parse address '%s': %s", arg, err_msg);
 	}
 
@@ -169,17 +171,17 @@ static char *opt_add_addr_withtype(const char *arg,
 
 static char *opt_add_addr(const char *arg, struct lightningd *ld)
 {
-	return opt_add_addr_withtype(arg, ld, ADDR_LISTEN_AND_ANNOUNCE);
+	return opt_add_addr_withtype(arg, ld, ADDR_LISTEN_AND_ANNOUNCE, true);
 }
 
 static char *opt_add_bind_addr(const char *arg, struct lightningd *ld)
 {
-	return opt_add_addr_withtype(arg, ld, ADDR_LISTEN);
+	return opt_add_addr_withtype(arg, ld, ADDR_LISTEN, true);
 }
 
 static char *opt_add_announce_addr(const char *arg, struct lightningd *ld)
 {
-	return opt_add_addr_withtype(arg, ld, ADDR_ANNOUNCE);
+	return opt_add_addr_withtype(arg, ld, ADDR_ANNOUNCE, false);
 }
 
 static char *opt_add_ipaddr(const char *arg, struct lightningd *ld)
@@ -295,6 +297,23 @@ static char *opt_set_offline(struct lightningd *ld)
 	return NULL;
 }
 
+static char *opt_add_proxy_addr(const char *arg, struct lightningd *ld)
+{
+	bool needed_dns;
+	tal_free(ld->proxyaddr);
+
+	/* We use a tal_arr here, so we can marshal it to gossipd */
+	ld->proxyaddr = tal_arr(ld, struct wireaddr, 1);
+
+	if (!parse_wireaddr(arg, ld->proxyaddr, 9050,
+			    ld->use_proxy_always ? &needed_dns : NULL,
+			    NULL)) {
+		return tal_fmt(NULL, "Unable to parse Tor proxy address '%s' %s",
+			       arg, needed_dns ? " (needed dns)" : "");
+	}
+	return NULL;
+}
+
 static void config_register_opts(struct lightningd *ld)
 {
 	opt_register_noarg("--daemon", opt_set_bool, &ld->daemon,
@@ -367,7 +386,7 @@ static void config_register_opts(struct lightningd *ld)
 			 "Set an IP address (v4 or v6) to listen on, but not announce");
 	opt_register_arg("--announce-addr", opt_add_announce_addr, NULL,
 			 ld,
-			 "Set an IP address (v4 or v6) to announce, but not listen on");
+			 "Set an IP address (v4 or v6) or .onion v2/v3 to announce, but not listen on");
 
 	opt_register_noarg("--offline", opt_set_offline, ld,
 			   "Start in offline-mode (do not automatically reconnect and do not accept incoming connections)");
@@ -398,6 +417,16 @@ static void config_register_opts(struct lightningd *ld)
 			 opt_set_u64, opt_show_u64,
 			 &ld->ini_autocleaninvoice_cycle,
 			 "If expired invoice autoclean enabled, invoices that have expired for at least this given seconds are cleaned");
+	opt_register_arg("--proxy", opt_add_proxy_addr, NULL,
+			ld,"Set a socks v5 proxy IP address and port");
+	opt_register_arg("--tor-service-password", opt_set_talstr, NULL,
+			 &ld->tor_service_password,
+			 "Set a Tor hidden service password");
+
+	/* Early, as it suppresses DNS lookups from cmdline too. */
+	opt_register_early_arg("--always-use-proxy",
+			       opt_set_bool_arg, opt_show_bool,
+			       &ld->use_proxy_always, "Use the proxy always");
 }
 
 #if DEVELOPER
@@ -552,6 +581,9 @@ static void check_config(struct lightningd *ld)
 
 	if (ld->config.anchor_confirms == 0)
 		fatal("anchor-confirms must be greater than zero");
+
+	if (ld->use_proxy_always && !ld->proxyaddr)
+		fatal("--always-use-proxy needs --proxy");
 }
 
 static void setup_default_config(struct lightningd *ld)
@@ -811,6 +843,15 @@ void handle_opts(struct lightningd *ld, int argc, char *argv[])
 	if (argc != 1)
 		errx(1, "no arguments accepted");
 
+	/* We keep a separate variable rather than overriding use_proxy_always,
+	 * so listconfigs shows the correct thing. */
+	if (tal_count(ld->proposed_wireaddr) != 0
+	    && all_tor_addresses(ld->proposed_wireaddr)) {
+		ld->pure_tor_setup = true;
+		if (!ld->proxyaddr)
+			log_info(ld->log, "Pure Tor setup with no --proxy:"
+				 " you won't be able to make connections out");
+	}
 	check_config(ld);
 }
 
@@ -937,6 +978,9 @@ static void add_config(struct lightningd *ld,
 					   ld->proposed_listen_announce,
 					   ADDR_ANNOUNCE);
 			return;
+		} else if (opt->cb_arg == (void *)opt_add_proxy_addr) {
+			if (ld->proxyaddr)
+				answer = fmt_wireaddr(name0, ld->proxyaddr);
 #if DEVELOPER
 		} else if (strstarts(name, "dev-")) {
 			/* Ignore dev settings */

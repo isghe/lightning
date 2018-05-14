@@ -1,14 +1,20 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <ccan/build_assert/build_assert.h>
+#include <ccan/io/io.h>
 #include <ccan/mem/mem.h>
+#include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
+#include <common/base32.h>
 #include <common/type_to_string.h>
 #include <common/utils.h>
 #include <common/wireaddr.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include <wire/wire.h>
 
 /* Returns false if we didn't parse it, and *cursor == NULL if malformed. */
@@ -22,6 +28,12 @@ bool fromwire_wireaddr(const u8 **cursor, size_t *max, struct wireaddr *addr)
 		break;
 	case ADDR_TYPE_IPV6:
 		addr->addrlen = 16;
+		break;
+	case ADDR_TYPE_TOR_V2:
+		addr->addrlen = TOR_V2_ADDRLEN;
+		break;
+	case ADDR_TYPE_TOR_V3:
+		addr->addrlen = TOR_V3_ADDRLEN;
 		break;
 	default:
 		return false;
@@ -62,11 +74,19 @@ void towire_wireaddr_internal(u8 **pptr, const struct wireaddr_internal *addr)
 		towire_u8_array(pptr, (const u8 *)addr->u.sockname,
 				sizeof(addr->u.sockname));
 		return;
+	case ADDR_INTERNAL_AUTOTOR:
+		towire_wireaddr(pptr, &addr->u.torservice);
+		return;
 	case ADDR_INTERNAL_ALLPROTO:
 		towire_u16(pptr, addr->u.port);
 		return;
 	case ADDR_INTERNAL_WIREADDR:
 		towire_wireaddr(pptr, &addr->u.wireaddr);
+		return;
+	case ADDR_INTERNAL_FORPROXY:
+		towire_u8_array(pptr, (const u8 *)addr->u.unresolved.name,
+				sizeof(addr->u.unresolved.name));
+		towire_u16(pptr, addr->u.unresolved.port);
 		return;
 	}
 	abort();
@@ -87,37 +107,23 @@ bool fromwire_wireaddr_internal(const u8 **cursor, size_t *max,
 	case ADDR_INTERNAL_ALLPROTO:
 		addr->u.port = fromwire_u16(cursor, max);
 		return *cursor != NULL;
+	case ADDR_INTERNAL_AUTOTOR:
+		return fromwire_wireaddr(cursor, max, &addr->u.torservice);
 	case ADDR_INTERNAL_WIREADDR:
 		return fromwire_wireaddr(cursor, max, &addr->u.wireaddr);
+	case ADDR_INTERNAL_FORPROXY:
+		fromwire_u8_array(cursor, max, (u8 *)addr->u.unresolved.name,
+				  sizeof(addr->u.unresolved.name));
+		/* Must be NUL terminated */
+		if (!memchr(addr->u.unresolved.name, 0,
+			    sizeof(addr->u.unresolved.name)))
+			fromwire_fail(cursor, max);
+		addr->u.unresolved.port = fromwire_u16(cursor, max);
+		return *cursor != NULL;
 	}
 	fromwire_fail(cursor, max);
 	return false;
 }
-
-char *fmt_wireaddr(const tal_t *ctx, const struct wireaddr *a)
-{
-	char addrstr[INET6_ADDRSTRLEN];
-	char *ret, *hex;
-
-	switch (a->type) {
-	case ADDR_TYPE_IPV4:
-		if (!inet_ntop(AF_INET, a->addr, addrstr, INET_ADDRSTRLEN))
-			return "Unprintable-ipv4-address";
-		return tal_fmt(ctx, "%s:%u", addrstr, a->port);
-	case ADDR_TYPE_IPV6:
-		if (!inet_ntop(AF_INET6, a->addr, addrstr, INET6_ADDRSTRLEN))
-			return "Unprintable-ipv6-address";
-		return tal_fmt(ctx, "[%s]:%u", addrstr, a->port);
-	case ADDR_TYPE_PADDING:
-		break;
-	}
-
-	hex = tal_hexstr(ctx, a->addr, a->addrlen);
-	ret = tal_fmt(ctx, "Unknown type %u %s:%u", a->type, hex, a->port);
-	tal_free(hex);
-	return ret;
-}
-REGISTER_TYPE_TO_STRING(wireaddr, fmt_wireaddr);
 
 void wireaddr_from_ipv4(struct wireaddr *addr,
 			const struct in_addr *ip4,
@@ -170,6 +176,8 @@ bool wireaddr_is_wildcard(const struct wireaddr *addr)
 	case ADDR_TYPE_IPV4:
 		return memeqzero(addr->addr, addr->addrlen);
 	case ADDR_TYPE_PADDING:
+	case ADDR_TYPE_TOR_V2:
+	case ADDR_TYPE_TOR_V3:
 		return false;
 	}
 	abort();
@@ -185,10 +193,52 @@ char *fmt_wireaddr_internal(const tal_t *ctx,
 		return tal_fmt(ctx, ":%u", a->u.port);
 	case ADDR_INTERNAL_WIREADDR:
 		return fmt_wireaddr(ctx, &a->u.wireaddr);
+	case ADDR_INTERNAL_FORPROXY:
+		return tal_fmt(ctx, "%s:%u",
+			       a->u.unresolved.name, a->u.unresolved.port);
+	case ADDR_INTERNAL_AUTOTOR:
+		return tal_fmt(ctx, "autotor:%s",
+			       fmt_wireaddr(tmpctx, &a->u.torservice));
 	}
 	abort();
 }
 REGISTER_TYPE_TO_STRING(wireaddr_internal, fmt_wireaddr_internal);
+
+char *fmt_wireaddr_without_port(const tal_t * ctx, const struct wireaddr *a)
+{
+	char *ret, *hex;
+	char addrstr[LARGEST_ADDRLEN];
+
+	switch (a->type) {
+	case ADDR_TYPE_IPV4:
+		if (!inet_ntop(AF_INET, a->addr, addrstr, INET_ADDRSTRLEN))
+			return "Unprintable-ipv4-address";
+		return tal_fmt(ctx, "%s", addrstr);
+	case ADDR_TYPE_IPV6:
+		if (!inet_ntop(AF_INET6, a->addr, addrstr, INET6_ADDRSTRLEN))
+			return "Unprintable-ipv6-address";
+		return tal_fmt(ctx, "[%s]", addrstr);
+	case ADDR_TYPE_TOR_V2:
+	case ADDR_TYPE_TOR_V3:
+		return tal_fmt(ctx, "%s.onion",
+			       b32_encode(tmpctx, a->addr, a->addrlen));
+	case ADDR_TYPE_PADDING:
+		break;
+	}
+
+	hex = tal_hexstr(ctx, a->addr, a->addrlen);
+	ret = tal_fmt(ctx, "Unknown type %u %s", a->type, hex);
+	tal_free(hex);
+	return ret;
+}
+
+char *fmt_wireaddr(const tal_t *ctx, const struct wireaddr *a)
+{
+	char *ret = fmt_wireaddr_without_port(ctx, a);
+	tal_append_fmt(&ret, ":%u", a->port);
+	return ret;
+}
+REGISTER_TYPE_TO_STRING(wireaddr, fmt_wireaddr);
 
 /* Valid forms:
  *
@@ -237,7 +287,8 @@ static bool separate_address_and_port(const tal_t *ctx, const char *arg,
 }
 
 bool wireaddr_from_hostname(struct wireaddr *addr, const char *hostname,
-			    const u16 port, const char **err_msg)
+			    const u16 port, bool *no_dns,
+			    const char **err_msg)
 {
 	struct sockaddr_in6 *sa6;
 	struct sockaddr_in *sa4;
@@ -245,6 +296,37 @@ bool wireaddr_from_hostname(struct wireaddr *addr, const char *hostname,
 	struct addrinfo hints;
 	int gai_err;
 	bool res = false;
+
+	if (no_dns)
+		*no_dns = false;
+
+	/* Don't do lookup on onion addresses. */
+	if (strends(hostname, ".onion")) {
+		u8 *dec = b32_decode(tmpctx, hostname,
+				     strlen(hostname) - strlen(".onion"));
+		if (tal_len(dec) == TOR_V2_ADDRLEN)
+			addr->type = ADDR_TYPE_TOR_V2;
+		else if (tal_len(dec) == TOR_V3_ADDRLEN)
+ 			addr->type = ADDR_TYPE_TOR_V3;
+		else {
+			if (err_msg)
+				*err_msg = "Invalid Tor address";
+			return false;
+		}
+
+		addr->addrlen = tal_len(dec);
+		addr->port = port;
+		memcpy(&addr->addr, dec, tal_len(dec));
+		return true;
+	}
+
+	/* Tell them we wanted DNS and fail. */
+	if (no_dns) {
+		if (err_msg)
+			*err_msg = "Needed DNS, but lookups suppressed";
+		*no_dns = true;
+		return false;
+	}
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
@@ -275,7 +357,7 @@ bool wireaddr_from_hostname(struct wireaddr *addr, const char *hostname,
 }
 
 bool parse_wireaddr(const char *arg, struct wireaddr *addr, u16 defport,
-		    const char **err_msg)
+		    bool *no_dns, const char **err_msg)
 {
 	struct in6_addr v6;
 	struct in_addr v4;
@@ -308,7 +390,7 @@ bool parse_wireaddr(const char *arg, struct wireaddr *addr, u16 defport,
 
 	/* Resolve with getaddrinfo */
 	if (!res)
-		res = wireaddr_from_hostname(addr, ip, port, err_msg);
+		res = wireaddr_from_hostname(addr, ip, port, no_dns, err_msg);
 
 finish:
 	if (!res && err_msg && !*err_msg)
@@ -317,10 +399,13 @@ finish:
 }
 
 bool parse_wireaddr_internal(const char *arg, struct wireaddr_internal *addr,
-			     u16 port, bool wildcard_ok, const char **err_msg)
+			     u16 port, bool wildcard_ok, bool dns_ok,
+			     bool unresolved_ok,
+			     const char **err_msg)
 {
-	u16 wildport;
+	u16 splitport;
 	char *ip;
+	bool needed_dns = false;
 
 	/* Addresses starting with '/' are local socket paths */
 	if (arg[0] == '/') {
@@ -338,16 +423,53 @@ bool parse_wireaddr_internal(const char *arg, struct wireaddr_internal *addr,
 
 	/* An empty string means IPv4 and IPv6 (which under Linux by default
 	 * means just IPv6, and IPv4 gets autobound). */
+	splitport = port;
 	if (wildcard_ok
-	    && separate_address_and_port(tmpctx, arg, &ip, &wildport)
+	    && separate_address_and_port(tmpctx, arg, &ip, &splitport)
 	    && streq(ip, "")) {
 		addr->itype = ADDR_INTERNAL_ALLPROTO;
-		addr->u.port = wildport;
+		addr->u.port = splitport;
 		return true;
 	}
 
+	/* 'autotor:' is a special prefix meaning talk to Tor to create
+	 * an onion address. */
+	if (strstarts(arg, "autotor:")) {
+		addr->itype = ADDR_INTERNAL_AUTOTOR;
+		return parse_wireaddr(arg + strlen("autotor:"),
+				      &addr->u.torservice, 9051,
+				      dns_ok ? NULL : &needed_dns,
+				      err_msg);
+	}
+
 	addr->itype = ADDR_INTERNAL_WIREADDR;
-	return parse_wireaddr(arg, &addr->u.wireaddr, port, err_msg);
+	if (parse_wireaddr(arg, &addr->u.wireaddr, port,
+			   dns_ok ? NULL : &needed_dns, err_msg))
+		return true;
+
+	if (!needed_dns || !unresolved_ok)
+		return false;
+
+	/* We can't do DNS, so keep unresolved. */
+	if (!wireaddr_from_unresolved(addr, ip, splitport)) {
+		if (err_msg)
+			*err_msg = "Name too long";
+		return false;
+	}
+	return true;
+}
+
+bool wireaddr_from_unresolved(struct wireaddr_internal *addr,
+			      const char *name, u16 port)
+{
+	addr->itype = ADDR_INTERNAL_FORPROXY;
+	if (strlen(name) >= sizeof(addr->u.unresolved.name))
+		return false;
+
+	memset(addr->u.unresolved.name, 0, sizeof(addr->u.unresolved.name));
+	strcpy(addr->u.unresolved.name, name);
+	addr->u.unresolved.port = port;
+	return true;
 }
 
 void wireaddr_from_sockname(struct wireaddr_internal *addr,
@@ -366,5 +488,91 @@ bool wireaddr_to_sockname(const struct wireaddr_internal *addr,
 	sun->sun_family = AF_LOCAL;
 	BUILD_ASSERT(sizeof(sun->sun_path) == sizeof(addr->u.sockname));
 	memcpy(sun->sun_path, addr->u.sockname, sizeof(addr->u.sockname));
+	return true;
+}
+
+struct addrinfo *wireaddr_internal_to_addrinfo(const tal_t *ctx,
+					       const struct wireaddr_internal *wireaddr)
+{
+	struct addrinfo *ai = talz(ctx, struct addrinfo);
+	struct sockaddr_un *sun;
+
+	ai->ai_socktype = SOCK_STREAM;
+
+	switch (wireaddr->itype) {
+	case ADDR_INTERNAL_SOCKNAME:
+		sun = tal(ai, struct sockaddr_un);
+		wireaddr_to_sockname(wireaddr, sun);
+		ai->ai_family = sun->sun_family;
+		ai->ai_addrlen = sizeof(*sun);
+		ai->ai_addr = (struct sockaddr *)sun;
+		return ai;
+	case ADDR_INTERNAL_ALLPROTO:
+	case ADDR_INTERNAL_AUTOTOR:
+	case ADDR_INTERNAL_FORPROXY:
+		break;
+	case ADDR_INTERNAL_WIREADDR:
+		return wireaddr_to_addrinfo(ctx, &wireaddr->u.wireaddr);
+	}
+	abort();
+}
+
+struct addrinfo *wireaddr_to_addrinfo(const tal_t *ctx,
+				      const struct wireaddr *wireaddr)
+{
+	struct addrinfo *ai = talz(ctx, struct addrinfo);
+	struct sockaddr_in *sin;
+	struct sockaddr_in6 *sin6;
+
+	ai->ai_socktype = SOCK_STREAM;
+
+	switch (wireaddr->type) {
+	case ADDR_TYPE_IPV4:
+		sin = tal(ai, struct sockaddr_in);
+		wireaddr_to_ipv4(wireaddr, sin);
+		ai->ai_family = sin->sin_family;
+		ai->ai_addrlen = sizeof(*sin);
+		ai->ai_addr = (struct sockaddr *)sin;
+		return ai;
+	case ADDR_TYPE_IPV6:
+		sin6 = tal(ai, struct sockaddr_in6);
+		wireaddr_to_ipv6(wireaddr, sin6);
+		ai->ai_family = sin6->sin6_family;
+		ai->ai_addrlen = sizeof(*sin6);
+		ai->ai_addr = (struct sockaddr *)sin6;
+		return ai;
+	case ADDR_TYPE_TOR_V2:
+	case ADDR_TYPE_TOR_V3:
+	case ADDR_TYPE_PADDING:
+		break;
+	}
+	abort();
+}
+
+bool all_tor_addresses(const struct wireaddr_internal *wireaddr)
+{
+	for (int i = 0; i < tal_count(wireaddr); i++) {
+		switch (wireaddr[i].itype) {
+		case ADDR_INTERNAL_SOCKNAME:
+			return false;
+		case ADDR_INTERNAL_FORPROXY:
+			abort();
+		case ADDR_INTERNAL_ALLPROTO:
+			return false;
+		case ADDR_INTERNAL_AUTOTOR:
+			continue;
+		case ADDR_INTERNAL_WIREADDR:
+			switch (wireaddr[i].u.wireaddr.type) {
+			case ADDR_TYPE_IPV4:
+			case ADDR_TYPE_IPV6:
+				return false;
+			case ADDR_TYPE_TOR_V2:
+			case ADDR_TYPE_TOR_V3:
+			case ADDR_TYPE_PADDING:
+				continue;
+			}
+		}
+		abort();
+	}
 	return true;
 }

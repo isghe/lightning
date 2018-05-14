@@ -11,9 +11,20 @@
 #include <wire/wire.h>
 
 #define ROUTING_MAX_HOPS 20
-#define ROUTING_FLAGS_DISABLED 2
+/* BOLT #7:
+ *
+ * The `flags` bitfield...individual bits:
+ *...
+ * | 0             | `direction` | Direction this update refers to. |
+ * | 1             | `disable`   | Disable the channel.             |
+ */
+#define ROUTING_FLAGS_DIRECTION (1 << 0)
+#define ROUTING_FLAGS_DISABLED  (1 << 1)
 
 struct half_chan {
+	/* Cached `channel_update` which initialized below (or NULL) */
+	const u8 *channel_update;
+
 	/* millisatoshi. */
 	u32 base_fee;
 	/* millionths */
@@ -22,9 +33,7 @@ struct half_chan {
 	/* Delay for HTLC in blocks.*/
 	u32 delay;
 
-	/* Is this connection active? */
-	bool active;
-
+	/* -1 if channel_update is NULL */
 	s64 last_timestamp;
 
 	/* Minimum number of msatoshi in an HTLC */
@@ -33,9 +42,6 @@ struct half_chan {
 	/* Flags as specified by the `channel_update`s, among other
 	 * things indicated direction wrt the `channel_id` */
 	u16 flags;
-
-	/* Cached `channel_update` we might forward to new peers (or 0) */
-	u64 channel_update_msgidx;
 
 	/* If greater than current time, this connection should not
 	 * be used for routing. */
@@ -54,14 +60,26 @@ struct chan {
 	/* node[0].id < node[1].id */
 	struct node *nodes[2];
 
-	/* Cached `channel_announcement` we might forward to new peers (or 0) */
-	u64 channel_announce_msgidx;
-
-	/* Is this a public channel, or was it only added locally? */
-	bool public;
+	/* NULL if not announced yet (ie. not public). */
+	const u8 *channel_announce;
 
 	u64 satoshis;
 };
+
+static inline bool is_chan_public(const struct chan *chan)
+{
+	return chan->channel_announce != NULL;
+}
+
+static inline bool is_halfchan_defined(const struct half_chan *hc)
+{
+	return hc->channel_update != NULL;
+}
+
+static inline bool is_halfchan_enabled(const struct half_chan *hc)
+{
+	return is_halfchan_defined(hc) && !(hc->flags & ROUTING_FLAGS_DISABLED);
+}
 
 struct node {
 	struct pubkey id;
@@ -91,8 +109,8 @@ struct node {
 	/* Color to be used when displaying the name */
 	u8 rgb_color[3];
 
-	/* Cached `node_announcement` we might forward to new peers (or 0). */
-	u64 node_announce_msgidx;
+	/* Cached `node_announcement` we might forward to new peers (or NULL). */
+	const u8 *node_announcement;
 };
 
 const secp256k1_pubkey *node_map_keyof_node(const struct node *n);
@@ -220,20 +238,11 @@ bool handle_pending_cannouncement(struct routing_state *rstate,
 				  const u8 *txscript);
 
 /* Returns NULL if all OK, otherwise an error for the peer which sent. */
-u8 *handle_channel_update(struct routing_state *rstate, const u8 *update);
+u8 *handle_channel_update(struct routing_state *rstate, const u8 *update,
+			  bool add_to_store);
 
 /* Returns NULL if all OK, otherwise an error for the peer which sent. */
 u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node);
-
-/* Set values on the struct node_connection */
-void set_connection_values(struct chan *chan,
-			   int idx,
-			   u32 base_fee,
-			   u32 proportional_fee,
-			   u32 delay,
-			   bool active,
-			   u64 timestamp,
-			   u32 htlc_minimum_msat);
 
 /* Get a node: use this instead of node_map_get() */
 struct node *get_node(struct routing_state *rstate, const struct pubkey *id);
@@ -301,6 +310,6 @@ bool routing_add_node_announcement(struct routing_state *rstate,
  * is the case for private channels or channels that have not yet reached
  * `announce_depth`.
  */
-void handle_local_add_channel(struct routing_state *rstate, u8 *msg);
+void handle_local_add_channel(struct routing_state *rstate, const u8 *msg);
 
 #endif /* LIGHTNING_GOSSIPD_ROUTING_H */

@@ -12,13 +12,6 @@
 #include <wallet/txfilter.h>
 #include <wallet/wallet.h>
 
-/* BOLT #1:
- *
- * The default TCP port is 9735. This corresponds to hexadecimal
- * `0x2607`, the Unicode code point for LIGHTNING.
- */
-#define DEFAULT_PORT 9735
-
 /* Various adjustable things. */
 struct config {
 	/* How long do we want them to lock up their funds? (blocks) */
@@ -76,6 +69,9 @@ struct config {
 	/* Number of blocks to rescan from the current head, or absolute
 	 * blockheight if rescan >= 500'000 */
 	s32 rescan;
+
+	/* ipv6 bind disable */
+	bool no_ipv6_bind;
 };
 
 struct lightningd {
@@ -195,6 +191,12 @@ struct lightningd {
 	/* Things we've marked as not leaking. */
 	const void **notleaks;
 #endif /* DEVELOPER */
+
+	/* tor support */
+	struct wireaddr *proxyaddr;
+	bool use_proxy_always;
+	char *tor_service_password;
+	bool pure_tor_setup;
 };
 
 const struct chainparams *get_chainparams(const struct lightningd *ld);

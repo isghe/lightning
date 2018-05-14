@@ -3,6 +3,7 @@
 #include "config.h"
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
+#include <lightningd/lightningd.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -13,6 +14,14 @@ struct in_addr;
 struct sockaddr_in6;
 struct sockaddr_in;
 struct sockaddr_un;
+
+/* BOLT #1:
+ *
+ * The default TCP port is 9735. This corresponds to hexadecimal
+ * `0x2607`, the Unicode code point for LIGHTNING.
+ */
+#define DEFAULT_PORT 9735
+
 
 /* BOLT #7:
  *
@@ -30,18 +39,23 @@ struct sockaddr_un;
  *             where `checksum = sha3(".onion checksum" | pubkey || version)[:2]`
  */
 
+#define	TOR_V2_ADDRLEN 10
+#define	TOR_V3_ADDRLEN 35
+#define	LARGEST_ADDRLEN TOR_V3_ADDRLEN
+
 enum wire_addr_type {
 	ADDR_TYPE_PADDING = 0,
 	ADDR_TYPE_IPV4 = 1,
 	ADDR_TYPE_IPV6 = 2,
+	ADDR_TYPE_TOR_V2 = 3,
+	ADDR_TYPE_TOR_V3 = 4
 };
 
-/* FIXME(cdecker) Extend this once we have defined how TOR addresses
- * should look like */
+/* Structure now fit for tor support */
 struct wireaddr {
 	enum wire_addr_type type;
 	u8 addrlen;
-	u8 addr[16];
+	u8 addr[LARGEST_ADDRLEN];
 	u16 port;
 };
 
@@ -61,12 +75,19 @@ enum addr_listen_announce fromwire_addr_listen_announce(const u8 **cursor,
 							size_t *max);
 void towire_addr_listen_announce(u8 **pptr, enum addr_listen_announce ala);
 
-bool parse_wireaddr(const char *arg, struct wireaddr *addr, u16 port, const char **err_msg);
+/* If no_dns is non-NULL, we will set it to true and return false if
+ * we wanted to do a DNS lookup. */
+bool parse_wireaddr(const char *arg, struct wireaddr *addr, u16 port,
+		    bool *no_dns, const char **err_msg);
 
 char *fmt_wireaddr(const tal_t *ctx, const struct wireaddr *a);
+char *fmt_wireaddr_without_port(const tal_t *ctx, const struct wireaddr *a);
 
+/* If no_dns is non-NULL, we will set it to true and return false if
+ * we wanted to do a DNS lookup. */
 bool wireaddr_from_hostname(struct wireaddr *addr, const char *hostname,
-			    const u16 port, const char **err_msg);
+			    const u16 port, bool *no_dns,
+			    const char **err_msg);
 
 void wireaddr_from_ipv4(struct wireaddr *addr,
 			const struct in_addr *ip4,
@@ -82,6 +103,8 @@ bool wireaddr_is_wildcard(const struct wireaddr *addr);
 enum wireaddr_internal_type {
 	ADDR_INTERNAL_SOCKNAME,
 	ADDR_INTERNAL_ALLPROTO,
+	ADDR_INTERNAL_AUTOTOR,
+	ADDR_INTERNAL_FORPROXY,
 	ADDR_INTERNAL_WIREADDR,
 };
 
@@ -93,11 +116,20 @@ struct wireaddr_internal {
 		struct wireaddr wireaddr;
 		/* ADDR_INTERNAL_ALLPROTO */
 		u16 port;
+		/* ADDR_INTERNAL_AUTOTOR */
+		struct wireaddr torservice;
+		/* ADDR_INTERNAL_FORPROXY */
+		struct unresolved {
+			char name[256];
+			u16 port;
+		} unresolved;
 		/* ADDR_INTERNAL_SOCKNAME */
 		char sockname[sizeof(((struct sockaddr_un *)0)->sun_path)];
 	} u;
 };
-bool parse_wireaddr_internal(const char *arg, struct wireaddr_internal *addr, u16 port, bool wildcard_ok, const char **err_msg);
+bool parse_wireaddr_internal(const char *arg, struct wireaddr_internal *addr,
+			     u16 port, bool wildcard_ok, bool dns_ok,
+			     bool unresolved_ok, const char **err_msg);
 
 void towire_wireaddr_internal(u8 **pptr,
 				 const struct wireaddr_internal *addr);
@@ -106,8 +138,19 @@ bool fromwire_wireaddr_internal(const u8 **cursor, size_t *max,
 char *fmt_wireaddr_internal(const tal_t *ctx,
 			       const struct wireaddr_internal *a);
 
+bool wireaddr_from_unresolved(struct wireaddr_internal *addr,
+			      const char *name, u16 port);
+
 void wireaddr_from_sockname(struct wireaddr_internal *addr,
 			    const char *sockname);
 bool wireaddr_to_sockname(const struct wireaddr_internal *addr,
 			  struct sockaddr_un *sun);
+
+struct addrinfo *wireaddr_to_addrinfo(const tal_t *ctx,
+				      const struct wireaddr *wireaddr);
+struct addrinfo *wireaddr_internal_to_addrinfo(const tal_t *ctx,
+					       const struct wireaddr_internal *wireaddr);
+
+bool all_tor_addresses(const struct wireaddr_internal *wireaddr);
+
 #endif /* LIGHTNING_COMMON_WIREADDR_H */
