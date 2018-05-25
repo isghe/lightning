@@ -630,7 +630,8 @@ static void send_node_announcement(struct daemon *daemon)
  * details of the failures. The caller is expected to return the error to the
  * peer, or drop the error if the message did not come from a peer.
  */
-static u8 *handle_gossip_msg(struct daemon *daemon, const u8 *msg)
+static u8 *handle_gossip_msg(struct daemon *daemon, const u8 *msg,
+			     const char *source)
 {
 	struct routing_state *rstate = daemon->rstate;
 	int t = fromwire_peektype(msg);
@@ -657,7 +658,7 @@ static u8 *handle_gossip_msg(struct daemon *daemon, const u8 *msg)
 		break;
 
 	case WIRE_CHANNEL_UPDATE:
-		err = handle_channel_update(rstate, msg, true);
+		err = handle_channel_update(rstate, msg, source);
 		if (err)
 			return err;
 		break;
@@ -760,7 +761,7 @@ static struct io_plan *peer_msgin(struct io_conn *conn,
 	case WIRE_CHANNEL_ANNOUNCEMENT:
 	case WIRE_NODE_ANNOUNCEMENT:
 	case WIRE_CHANNEL_UPDATE:
-		err = handle_gossip_msg(peer->daemon, msg);
+		err = handle_gossip_msg(peer->daemon, msg, "peer");
 		if (err)
 			queue_peer_msg(peer, take(err));
 		return peer_next_in(conn, peer);
@@ -926,6 +927,123 @@ static void handle_get_update(struct peer *peer, const u8 *msg)
 	daemon_conn_send(peer->remote, take(msg));
 }
 
+static u8 *create_channel_update(const tal_t *ctx,
+				 struct routing_state *rstate,
+				 const struct chan *chan,
+				 int direction,
+				 bool disable,
+				 u16 cltv_expiry_delta,
+				 u64 htlc_minimum_msat,
+				 u32 fee_base_msat,
+				 u32 fee_proportional_millionths)
+{
+	secp256k1_ecdsa_signature dummy_sig;
+	u8 *update, *msg;
+	u32 timestamp = time_now().ts.tv_sec;
+	u16 flags;
+
+	/* So valgrind doesn't complain */
+	memset(&dummy_sig, 0, sizeof(dummy_sig));
+
+	/* Don't send duplicate timestamps. */
+	if (is_halfchan_defined(&chan->half[direction])
+	    && timestamp == chan->half[direction].last_timestamp)
+		timestamp++;
+
+	flags = direction;
+	if (disable)
+		flags |= ROUTING_FLAGS_DISABLED;
+
+	update = towire_channel_update(tmpctx, &dummy_sig,
+				       &rstate->chain_hash,
+				       &chan->scid,
+				       timestamp,
+				       flags, cltv_expiry_delta,
+				       htlc_minimum_msat,
+				       fee_base_msat,
+				       fee_proportional_millionths);
+
+	if (!wire_sync_write(HSM_FD,
+			     towire_hsm_cupdate_sig_req(tmpctx, update))) {
+		status_failed(STATUS_FAIL_HSM_IO, "Writing cupdate_sig_req: %s",
+			      strerror(errno));
+	}
+
+	msg = wire_sync_read(tmpctx, HSM_FD);
+	if (!msg || !fromwire_hsm_cupdate_sig_reply(ctx, msg, &update)) {
+		status_failed(STATUS_FAIL_HSM_IO,
+			      "Reading cupdate_sig_req: %s",
+			      strerror(errno));
+	}
+
+	return update;
+}
+
+static void handle_local_channel_update(struct peer *peer, const u8 *msg)
+{
+	struct short_channel_id scid;
+	u16 cltv_delta;
+	u64 htlc_minimum_msat;
+	u32 fee_base_msat, fee_proportional_millionths;
+	bool disable;
+	struct chan *chan;
+	int direction;
+	u8 *cupdate, *err;
+	const struct pubkey *my_id = &peer->daemon->rstate->local_id;
+
+	if (!fromwire_gossip_local_channel_update(msg, &scid, &disable,
+						  &cltv_delta,
+						  &htlc_minimum_msat,
+						  &fee_base_msat,
+						  &fee_proportional_millionths)) {
+		status_broken("peer %s bad local_channel_update %s",
+			      type_to_string(tmpctx, struct pubkey, &peer->id),
+			      tal_hex(tmpctx, msg));
+		return;
+	}
+
+	/* Can theoretically happen if channel just closed. */
+	chan = get_channel(peer->daemon->rstate, &scid);
+	if (!chan) {
+		status_trace("peer %s local_channel_update for unknown %s",
+			      type_to_string(tmpctx, struct pubkey, &peer->id),
+			      type_to_string(tmpctx, struct short_channel_id,
+					     &scid));
+		return;
+	}
+
+	if (pubkey_eq(&chan->nodes[0]->id, my_id))
+		direction = 0;
+	else if (pubkey_eq(&chan->nodes[1]->id, my_id))
+		direction = 1;
+	else {
+		status_broken("peer %s bad local_channel_update for non-local %s",
+			      type_to_string(tmpctx, struct pubkey, &peer->id),
+			      type_to_string(tmpctx, struct short_channel_id,
+					     &scid));
+		return;
+	}
+
+	cupdate = create_channel_update(tmpctx, peer->daemon->rstate,
+					chan, direction,
+					disable, cltv_delta,
+					htlc_minimum_msat,
+					fee_base_msat,
+					fee_proportional_millionths);
+
+	err = handle_channel_update(peer->daemon->rstate, cupdate,
+				    "local_channel_update");
+	if (err)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Rejected local channel update %s: %s",
+			      tal_hex(tmpctx, cupdate),
+			      tal_hex(tmpctx, err));
+
+	/* We always tell peer, even if it's not public yet */
+	if (!is_chan_public(chan))
+		queue_peer_msg(peer, take(cupdate));
+}
+
 /**
  * owner_msg_in - Called by the `peer->remote` upon receiving a
  * message
@@ -939,7 +1057,7 @@ static struct io_plan *owner_msg_in(struct io_conn *conn,
 	int type = fromwire_peektype(msg);
 	if (type == WIRE_CHANNEL_ANNOUNCEMENT || type == WIRE_CHANNEL_UPDATE ||
 	    type == WIRE_NODE_ANNOUNCEMENT) {
-		err = handle_gossip_msg(peer->daemon, dc->msg_in);
+		err = handle_gossip_msg(peer->daemon, dc->msg_in, "subdaemon");
 		if (err)
 			queue_peer_msg(peer, take(err));
 
@@ -949,6 +1067,8 @@ static struct io_plan *owner_msg_in(struct io_conn *conn,
 		gossip_store_local_add_channel(peer->daemon->rstate->store,
 					       dc->msg_in);
 		handle_local_add_channel(peer->daemon->rstate, dc->msg_in);
+	} else if (type == WIRE_GOSSIP_LOCAL_CHANNEL_UPDATE) {
+		handle_local_channel_update(peer, dc->msg_in);
 	} else {
 		status_broken("peer %s: send us unknown msg of type %s",
 			      type_to_string(tmpctx, struct pubkey, &peer->id),
@@ -1439,50 +1559,25 @@ fail:
 }
 
 static void gossip_send_keepalive_update(struct routing_state *rstate,
-					 struct half_chan *hc)
+					 const struct chan *chan,
+					 const struct half_chan *hc)
 {
-	secp256k1_ecdsa_signature sig;
-	struct bitcoin_blkid chain_hash;
-	struct short_channel_id scid;
-	u32 timestamp, fee_base_msat, fee_proportional_millionths;
-	u64 htlc_minimum_msat;
-	u16 flags, cltv_expiry_delta;
-	u8 *update, *msg, *err;
+	u8 *update, *err;
 
-	/* Parse old update */
-	if (!fromwire_channel_update(
-		hc->channel_update, &sig, &chain_hash, &scid, &timestamp,
-		&flags, &cltv_expiry_delta, &htlc_minimum_msat, &fee_base_msat,
-		&fee_proportional_millionths)) {
-		status_failed(
-		    STATUS_FAIL_INTERNAL_ERROR,
-		    "Unable to parse previously accepted channel_update");
-	}
-
-	/* Now generate a new update, with up to date timestamp */
-	timestamp = time_now().ts.tv_sec;
-	update =
-	    towire_channel_update(tmpctx, &sig, &chain_hash, &scid, timestamp,
-				  flags, cltv_expiry_delta, htlc_minimum_msat,
-				  fee_base_msat, fee_proportional_millionths);
-
-	if (!wire_sync_write(HSM_FD,
-			     towire_hsm_cupdate_sig_req(tmpctx, update))) {
-		status_failed(STATUS_FAIL_HSM_IO, "Writing cupdate_sig_req: %s",
-			      strerror(errno));
-	}
-
-	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!msg || !fromwire_hsm_cupdate_sig_reply(tmpctx, msg, &update)) {
-		status_failed(STATUS_FAIL_HSM_IO,
-			      "Reading cupdate_sig_req: %s",
-			      strerror(errno));
-	}
+	/* Generate a new update, with up to date timestamp */
+	update = create_channel_update(tmpctx, rstate, chan,
+				       hc->flags & ROUTING_FLAGS_DIRECTION,
+				       false,
+				       hc->delay,
+				       hc->htlc_minimum_msat,
+				       hc->base_fee,
+				       hc->proportional_fee);
 
 	status_trace("Sending keepalive channel_update for %s",
-		     type_to_string(tmpctx, struct short_channel_id, &scid));
+		     type_to_string(tmpctx, struct short_channel_id,
+				    &chan->scid));
 
-	err = handle_channel_update(rstate, update, true);
+	err = handle_channel_update(rstate, update, "keepalive");
 	if (err)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "rejected keepalive channel_update: %s",
@@ -1525,7 +1620,8 @@ static void gossip_refresh_network(struct daemon *daemon)
 				continue;
 			}
 
-			gossip_send_keepalive_update(daemon->rstate, hc);
+			gossip_send_keepalive_update(daemon->rstate, n->chans[i],
+						     hc);
 		}
 	}
 
@@ -2420,7 +2516,7 @@ static struct io_plan *handle_disable_channel(struct io_conn *conn,
 			      strerror(errno));
 	}
 
-	err = handle_channel_update(daemon->rstate, msg, true);
+	err = handle_channel_update(daemon->rstate, msg, "disable_channel");
 	if (err)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "rejected disabling channel_update: %s",
@@ -2578,6 +2674,7 @@ static struct io_plan *recv_req(struct io_conn *conn, struct daemon_conn *master
 	case WIRE_GOSSIP_GET_UPDATE_REPLY:
 	case WIRE_GOSSIP_SEND_GOSSIP:
 	case WIRE_GOSSIP_LOCAL_ADD_CHANNEL:
+	case WIRE_GOSSIP_LOCAL_CHANNEL_UPDATE:
 	case WIRE_GOSSIP_GET_TXOUT:
 	case WIRE_GOSSIPCTL_PEER_DISCONNECT_REPLY:
 	case WIRE_GOSSIPCTL_PEER_DISCONNECT_REPLYFAIL:

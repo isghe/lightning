@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
+#include <lightningd/channel_control.h>
 #include <lightningd/invoice.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/log.h>
@@ -78,7 +79,6 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->reconnect = true;
 	timers_init(&ld->timers, time_mono());
 	ld->topology = new_topology(ld, ld->log);
-	ld->debug_subdaemon_io = NULL;
 	ld->daemon = false;
 	ld->pidfile = NULL;
 	ld->ini_autocleaninvoice_cycle = 0;
@@ -87,6 +87,8 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->use_proxy_always = false;
 	ld->pure_tor_setup = false;
 	ld->tor_service_password = NULL;
+	ld->max_funding_unconfirmed = 2016;
+
 	return ld;
 }
 
@@ -293,6 +295,14 @@ static int io_poll_lightningd(struct pollfd *fds, nfds_t nfds, int timeout)
 	return io_poll_debug(fds, nfds, timeout);
 }
 
+void notify_new_block(struct lightningd *ld,
+		      u32 block_height)
+{
+	/* Inform our subcomponents individually. */
+	htlcs_notify_new_block(ld, block_height);
+	channel_notify_new_block(ld, block_height);
+}
+
 int main(int argc, char *argv[])
 {
 	struct lightningd *ld;
@@ -395,7 +405,6 @@ int main(int argc, char *argv[])
 	/* Initialize block topology (does its own transaction) */
 	setup_topology(ld->topology,
 		       &ld->timers,
-		       ld->config.poll_time,
 		       blockheight);
 
 	/* Create RPC socket (if any) */

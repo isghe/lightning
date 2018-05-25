@@ -200,6 +200,10 @@ ifneq ($(TEST_GROUP_COUNT),)
 PYTEST_OPTS += --test-group=$(TEST_GROUP) --test-group-count=$(TEST_GROUP_COUNT)
 endif
 
+ifneq ($(PYTEST_PAR),)
+PYTEST_OPTS += -n=$(PYTEST_PAR)
+endif
+
 check:
 	$(MAKE) installcheck
 	$(MAKE) pytest
@@ -272,7 +276,10 @@ check-shellcheck:
 check-setup_locale:
 	@tools/check-setup_locale.sh
 
-check-source: check-makefile check-source-bolt check-whitespace check-markdown check-spelling check-python check-includes check-cppcheck check-shellcheck check-setup_locale
+check-tmpctx:
+	@if git grep -n 'tal_free[(]tmpctx)' | grep -Ev '^ccan/|/test/|^common/daemon.c:|^common/utils.c:'; then echo "Don't free tmpctx!">&2; exit 1; fi
+
+check-source: check-makefile check-source-bolt check-whitespace check-markdown check-spelling check-python check-includes check-cppcheck check-shellcheck check-setup_locale check-tmpctx
 
 full-check: check check-source
 
@@ -332,6 +339,7 @@ update-ccan:
 	grep -v '^CCAN version:' ccan.old/README > ccan/README
 	echo CCAN version: `git -C ../ccan describe` >> ccan/README
 	$(RM) -r ccan.old
+	$(RM) -r ccan/ccan/hash/ ccan/ccan/tal/talloc/	# Unnecessary deps
 
 # Now ALL_PROGRAMS is fully populated, we can expand it.
 all-programs: $(ALL_PROGRAMS)

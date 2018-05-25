@@ -93,7 +93,7 @@ struct chain_topology {
 	unsigned int first_blocknum;
 
 	/* How often to poll. */
-	struct timerel poll_time;
+	u32 poll_seconds;
 
 	/* The bitcoind. */
 	struct bitcoind *bitcoind;
@@ -104,15 +104,17 @@ struct chain_topology {
 	/* Bitcoin transactions we're broadcasting */
 	struct list_head outgoing_txs;
 
-	/* Force a particular fee rate regardless of estimatefee (satoshis/kw) */
-	u32 *override_fee_rate;
-
 	/* What fee we use if estimatefee fails (satoshis/kw) */
 	u32 default_fee_rate;
 
 	/* Transactions/txos we are watching. */
 	struct txwatch_hash txwatches;
 	struct txowatch_hash txowatches;
+
+#if DEVELOPER
+	/* Force a particular fee rate regardless of estimatefee (satoshis/kw) */
+	u32 *dev_override_fee_rate;
+#endif
 };
 
 /* Information relevant to locating a TX in a blockchain. */
@@ -150,13 +152,12 @@ void broadcast_tx(struct chain_topology *topo,
 struct chain_topology *new_topology(struct lightningd *ld, struct log *log);
 void setup_topology(struct chain_topology *topology,
 		    struct timers *timers,
-		    struct timerel poll_time, u32 first_channel_block);
+		    u32 first_channel_block);
 
 void begin_topology(struct chain_topology *topo);
 
 struct txlocator *locate_tx(const void *ctx, const struct chain_topology *topo, const struct bitcoin_txid *txid);
 
-void notify_new_block(struct lightningd *ld, unsigned int height);
 void notify_feerate_change(struct lightningd *ld);
 
 #if DEVELOPER

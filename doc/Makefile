@@ -5,6 +5,7 @@ doc-wrongdir:
 	$(MAKE) -C .. doc-all
 
 MANPAGES := doc/lightning-cli.1 \
+	doc/lightningd-config.5 \
 	doc/lightning-autocleaninvoice.7 \
 	doc/lightning-close.7 \
 	doc/lightning-connect.7 \
@@ -61,6 +62,11 @@ doc/full-states.dot: test/test_state_coverage
 
 maintainer-clean: doc-maintainer-clean
 clean: doc-clean
+check: check-manpages
+
+check-manpages: cli/lightning-cli lightningd/lightningd
+	@tools/check-manpage.sh cli/lightning-cli doc/lightning-cli.1.txt
+	@tools/check-manpage.sh lightningd/lightningd doc/lightningd-config.5.txt
 
 doc-maintainer-clean:
 	$(RM) doc/deployable-lightning.pdf

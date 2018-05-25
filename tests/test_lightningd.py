@@ -299,6 +299,13 @@ class BaseLightningDTests(unittest.TestCase):
             return 1
         return 0
 
+    def checkBadGossipOrder(self, node):
+        # We can have a race where we notice a channel deleted and someone
+        # sends an update, and we can get unknown channel updates in errors.
+        if node.daemon.is_in_log('Bad gossip order from (?!error)') and not node.daemon.is_in_log('Deleting channel'):
+            return 1
+        return 0
+
     def tearDown(self):
         ok = self.node_factory.killall([not n.may_fail for n in self.node_factory.nodes])
         self.executor.shutdown(wait=False)
@@ -321,6 +328,11 @@ class BaseLightningDTests(unittest.TestCase):
             err_count += self.checkReconnect(node)
         if err_count:
             raise ValueError("{} nodes had unexpected reconnections".format(err_count))
+
+        for node in self.node_factory.nodes:
+            err_count += self.checkBadGossipOrder(node)
+        if err_count:
+            raise ValueError("{} nodes had bad gossip order".format(err_count))
 
         if not ok:
             raise Exception("At least one lightning exited with unexpected non-zero return code")
@@ -413,6 +425,7 @@ class LightningDTests(BaseLightningDTests):
     def test_autocleaninvoice(self):
         l1 = self.node_factory.get_node()
 
+        start_time = time.time()
         l1.rpc.autocleaninvoice(cycle_seconds=8, expired_by=2)
 
         l1.rpc.invoice(msatoshi=12300, label='inv1', description='1', expiry=4)
@@ -423,7 +436,7 @@ class LightningDTests(BaseLightningDTests):
         assert len(l1.rpc.listinvoices('inv1')['invoices']) == 1
         assert len(l1.rpc.listinvoices('inv2')['invoices']) == 1
 
-        time.sleep(6)   # total 6
+        time.sleep(start_time - time.time() + 6)   # total 6
         # Both should still be there - auto clean cycle not started.
         # inv1 should be expired
         assert len(l1.rpc.listinvoices('inv1')['invoices']) == 1
@@ -431,19 +444,19 @@ class LightningDTests(BaseLightningDTests):
         assert len(l1.rpc.listinvoices('inv2')['invoices']) == 1
         assert l1.rpc.listinvoices('inv2')['invoices'][0]['status'] != 'expired'
 
-        time.sleep(4)   # total 10
+        time.sleep(start_time - time.time() + 10)   # total 10
         # inv1 should have deleted, inv2 still there and unexpired.
         assert len(l1.rpc.listinvoices('inv1')['invoices']) == 0
         assert len(l1.rpc.listinvoices('inv2')['invoices']) == 1
         assert l1.rpc.listinvoices('inv2')['invoices'][0]['status'] != 'expired'
 
-        time.sleep(4)   # total 14
+        time.sleep(start_time - time.time() + 14)   # total 14
         # inv2 should still be there, but expired
         assert len(l1.rpc.listinvoices('inv1')['invoices']) == 0
         assert len(l1.rpc.listinvoices('inv2')['invoices']) == 1
         assert l1.rpc.listinvoices('inv2')['invoices'][0]['status'] == 'expired'
 
-        time.sleep(4)   # total 18
+        time.sleep(start_time - time.time() + 18)   # total 18
         # Everything deleted
         assert len(l1.rpc.listinvoices('inv1')['invoices']) == 0
         assert len(l1.rpc.listinvoices('inv2')['invoices']) == 0
@@ -1051,13 +1064,16 @@ class LightningDTests(BaseLightningDTests):
         assert l2.rpc.listinvoices('testpayment2')['invoices'][0]['msatoshi_received'] == rs['msatoshi']
 
         # Balances should reflect it.
-        time.sleep(1)
-        p1 = l1.rpc.getpeer(l2.info['id'], 'info')
-        p2 = l2.rpc.getpeer(l1.info['id'], 'info')
-        assert p1['channels'][0]['msatoshi_to_us'] == 10**6 * 1000 - amt
-        assert p1['channels'][0]['msatoshi_total'] == 10**6 * 1000
-        assert p2['channels'][0]['msatoshi_to_us'] == amt
-        assert p2['channels'][0]['msatoshi_total'] == 10**6 * 1000
+        def check_balances():
+            p1 = l1.rpc.getpeer(l2.info['id'], 'info')
+            p2 = l2.rpc.getpeer(l1.info['id'], 'info')
+            return (
+                p1['channels'][0]['msatoshi_to_us'] == 10**6 * 1000 - amt and
+                p1['channels'][0]['msatoshi_total'] == 10**6 * 1000 and
+                p2['channels'][0]['msatoshi_to_us'] == amt and
+                p2['channels'][0]['msatoshi_total'] == 10**6 * 1000
+            )
+        wait_for(check_balances)
 
         # Repeat will "succeed", but won't actually send anything (duplicate)
         assert not l1.daemon.is_in_log('... succeeded')
@@ -1274,7 +1290,7 @@ class LightningDTests(BaseLightningDTests):
 
     def test_bad_opening(self):
         # l1 asks for a too-long locktime
-        l1 = self.node_factory.get_node(options={'locktime-blocks': 100})
+        l1 = self.node_factory.get_node(options={'watchtime-blocks': 100})
         l2 = self.node_factory.get_node(options={'max-locktime-blocks': 99})
         ret = l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
@@ -1288,6 +1304,7 @@ class LightningDTests(BaseLightningDTests):
 
         l2.daemon.wait_for_log('to_self_delay 100 larger than 99')
 
+    @unittest.skipIf(not DEVELOPER, "Too slow without --dev-bitcoind-poll")
     def test_closing(self):
         l1, l2 = self.connect()
 
@@ -1460,12 +1477,13 @@ class LightningDTests(BaseLightningDTests):
             c1 = self.executor.submit(l1.rpc.close, l2.info['id'])
             c2 = self.executor.submit(l2.rpc.close, l1.info['id'])
             # Wait for close to finish
-            c1.result(10)
-            c2.result(10)
+            c1.result(utils.TIMEOUT)
+            c2.result(utils.TIMEOUT)
             l1.daemon.wait_for_log('sendrawtx exit 0')
             # Get close confirmed
             l1.bitcoin.generate_block(100)
 
+    @unittest.skipIf(not DEVELOPER, "needs dev-override-feerates")
     def test_closing_different_fees(self):
         l1 = self.node_factory.get_node()
 
@@ -1481,9 +1499,9 @@ class LightningDTests(BaseLightningDTests):
         for feerate in feerates:
             for amount in amounts:
                 p = self.node_factory.get_node(options={
-                    'override-fee-rates': '{}/{}/{}'.format(feerate[0],
-                                                            feerate[1],
-                                                            feerate[2])
+                    'dev-override-fee-rates': '{}/{}/{}'.format(feerate[0],
+                                                                feerate[1],
+                                                                feerate[2])
                 })
                 p.feerate = feerate
                 p.amount = amount
@@ -1566,10 +1584,14 @@ class LightningDTests(BaseLightningDTests):
                  ['ONCHAIN:Tracking their unilateral close',
                   'ONCHAIN:All outputs resolved: waiting 99 more blocks before forgetting channel'])
 
-        billboard = l2.rpc.listpeers(l1.info['id'])['peers'][0]['channels'][0]['status']
-        assert len(billboard) == 2
-        assert billboard[0] == 'ONCHAIN:Tracking our own unilateral close'
-        assert re.fullmatch('ONCHAIN:.* outputs unresolved: in 4 blocks will spend DELAYED_OUTPUT_TO_US \(.*:0\) using OUR_DELAYED_RETURN_TO_WALLET', billboard[1])
+        def check_billboard():
+            billboard = l2.rpc.listpeers(l1.info['id'])['peers'][0]['channels'][0]['status']
+            return (
+                len(billboard) == 2 and
+                billboard[0] == 'ONCHAIN:Tracking our own unilateral close' and
+                re.fullmatch('ONCHAIN:.* outputs unresolved: in 4 blocks will spend DELAYED_OUTPUT_TO_US \(.*:0\) using OUR_DELAYED_RETURN_TO_WALLET', billboard[1])
+            )
+        wait_for(check_billboard)
 
         # Now, mine 4 blocks so it sends out the spending tx.
         bitcoind.generate_block(4)
@@ -1604,7 +1626,7 @@ class LightningDTests(BaseLightningDTests):
         disconnects = ['+WIRE_FUNDING_LOCKED', 'permfail']
         l1 = self.node_factory.get_node(disconnect=disconnects)
         # Make locktime different, as we once had them reversed!
-        l2 = self.node_factory.get_node(options={'locktime-blocks': 10})
+        l2 = self.node_factory.get_node(options={'watchtime-blocks': 10})
 
         l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
@@ -1688,7 +1710,7 @@ class LightningDTests(BaseLightningDTests):
     @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
     def test_onchaind_replay(self):
         disconnects = ['+WIRE_REVOKE_AND_ACK', 'permfail']
-        options = {'locktime-blocks': 201, 'cltv-delta': 101}
+        options = {'watchtime-blocks': 201, 'cltv-delta': 101}
         l1 = self.node_factory.get_node(options=options, disconnect=disconnects)
         l2 = self.node_factory.get_node(options=options)
 
@@ -2635,22 +2657,6 @@ class LightningDTests(BaseLightningDTests):
         # Allow announce messages.
         l1.bitcoin.generate_block(5)
 
-        def settle_gossip(n):
-            """Wait for gossip to settle at the node
-            """
-            expected_connections = 2 * (len(nodes) - 1)
-            start_time = time.time()
-            # Wait at most 10 seconds, broadcast interval is 1 second
-            while time.time() - start_time < 10:
-                channels = n.rpc.listchannels()['channels']
-                if len(channels) == expected_connections:
-                    break
-                else:
-                    time.sleep(0.1)
-
-        for n in nodes:
-            settle_gossip(n)
-
         # Deep check that all channels are in there
         comb = []
         for i in range(len(nodes) - 1):
@@ -2658,12 +2664,15 @@ class LightningDTests(BaseLightningDTests):
             comb.append((nodes[i + 1].info['id'], nodes[i].info['id']))
 
         for n in nodes:
-            seen = []
-            channels = n.rpc.listchannels()['channels']
-            for c in channels:
-                seen.append((c['source'], c['destination']))
-            assert set(seen) == set(comb)
+            def check_gossip():
+                seen = []
+                channels = n.rpc.listchannels()['channels']
+                for c in channels:
+                    seen.append((c['source'], c['destination']))
+                return set(seen) == set(comb)
+            wait_for(check_gossip)
 
+    @unittest.skipIf(not DEVELOPER, "Too slow without --dev-bitcoind-poll")
     def test_forward(self):
         # Connect 1 -> 2 -> 3.
         l1, l2 = self.connect()
@@ -3360,7 +3369,7 @@ class LightningDTests(BaseLightningDTests):
 
     def test_shutdown_awaiting_lockin(self):
         l1 = self.node_factory.get_node()
-        l2 = self.node_factory.get_node(options={'anchor-confirms': 3})
+        l2 = self.node_factory.get_node(options={'funding-confirms': 3})
 
         l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
         self.give_funds(l1, 10**6 + 1000000)
@@ -3610,8 +3619,8 @@ class LightningDTests(BaseLightningDTests):
         """Add some funds, fund a channel without enough funds"""
         # Previous runs with same bitcoind can leave funds!
         l1 = self.node_factory.get_node(random_hsm=True)
-        max_locktime = 3 * 6 * 24
-        l2 = self.node_factory.get_node(options={'locktime-blocks': max_locktime + 1})
+        max_locktime = 5 * 6 * 24
+        l2 = self.node_factory.get_node(options={'watchtime-blocks': max_locktime + 1})
         l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
         funds = 1000000
@@ -3630,7 +3639,7 @@ class LightningDTests(BaseLightningDTests):
         assert l2.rpc.listpeers()['peers'][0]['connected']
 
         # Restart l2 without ridiculous locktime.
-        del l2.daemon.opts['locktime-blocks']
+        del l2.daemon.opts['watchtime-blocks']
         l2.restart()
         l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
@@ -3672,7 +3681,7 @@ class LightningDTests(BaseLightningDTests):
 
     def test_lockin_between_restart(self):
         l1 = self.node_factory.get_node(may_reconnect=True)
-        l2 = self.node_factory.get_node(options={'anchor-confirms': 3},
+        l2 = self.node_factory.get_node(options={'funding-confirms': 3},
                                         may_reconnect=True)
         l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
@@ -3940,6 +3949,7 @@ class LightningDTests(BaseLightningDTests):
         assert not l2.daemon.is_in_log('signature verification failed')
         assert not l3.daemon.is_in_log('signature verification failed')
 
+    @unittest.skipIf(not DEVELOPER, "Too slow without --dev-bitcoind-poll")
     def test_waitinvoice(self):
         """Test waiting for one invoice will not return if another invoice
         is paid.
@@ -3978,6 +3988,7 @@ class LightningDTests(BaseLightningDTests):
         time.sleep(1)
         assert not f3.done()
 
+    @unittest.skipIf(not DEVELOPER, "Too slow without --dev-bitcoind-poll")
     def test_waitanyinvoice(self):
         """Test various variants of waiting for the next invoice to complete.
         """
@@ -4146,7 +4157,7 @@ class LightningDTests(BaseLightningDTests):
         # L1 asks for stupid low fees
         l1.rpc.dev_setfees(15)
 
-        l1.daemon.wait_for_log('Peer permanent failure in CHANNELD_NORMAL: lightning_channeld: received ERROR channel .*: update_fee 15 outside range 500-75000')
+        l1.daemon.wait_for_log('Peer permanent failure in CHANNELD_NORMAL: lightning_channeld: received ERROR channel .*: update_fee 15 outside range 1875-75000')
         # Make sure the resolution of this one doesn't interfere with the next!
         # Note: may succeed, may fail with insufficient fee, depending on how
         # bitcoind feels!
@@ -4217,8 +4228,7 @@ class LightningDTests(BaseLightningDTests):
         l2.daemon.wait_for_log('onchaind complete, forgetting peer')
 
     def test_io_logging(self):
-        l1 = self.node_factory.get_node(options={'debug-subdaemon-io': 'channeld',
-                                                 'log-level': 'io'})
+        l1 = self.node_factory.get_node(options={'log-level': 'io'})
         l2 = self.node_factory.get_node()
         l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
@@ -4236,6 +4246,9 @@ class LightningDTests(BaseLightningDTests):
         pidline = l2.daemon.wait_for_log(r'lightning_channeld.*: pid [0-9]*,')
         pid2 = re.search(r'pid ([0-9]*),', pidline).group(1)
         l2.daemon.wait_for_log(' to CHANNELD_NORMAL')
+
+        # Send it sigusr1: should turn on logging.
+        subprocess.run(['kill', '-USR1', pid1])
 
         fut = self.pay(l1, l2, 200000000, async=True)
 
@@ -4255,7 +4268,7 @@ class LightningDTests(BaseLightningDTests):
         assert not l1.daemon.is_in_log(r'channeld.*:\[IN\] 0082',
                                        start=l1.daemon.logsearch_start)
 
-        # IO logs should appear in peer logs.
+        # IO logs should not appear in peer logs.
         peerlog = l2.rpc.listpeers(l1.info['id'], "io")['peers'][0]['log']
         assert not any(l['type'] == 'IO_OUT' or l['type'] == 'IO_IN'
                        for l in peerlog)
@@ -4288,7 +4301,7 @@ class LightningDTests(BaseLightningDTests):
         # Make l2 upset by asking for crazy fee.
         l1.rpc.dev_setfees('150000')
         # Wait for l1 notice
-        l1.daemon.wait_for_log(r'Peer permanent failure in CHANNELD_NORMAL: lightning_channeld: received ERROR channel .*: update_fee 150000 outside range 500-75000')
+        l1.daemon.wait_for_log(r'Peer permanent failure in CHANNELD_NORMAL: lightning_channeld: received ERROR channel .*: update_fee 150000 outside range 1875-75000')
 
         # Can't pay while its offline.
         self.assertRaises(ValueError, l1.rpc.sendpay, to_json(route), rhash)
@@ -4328,7 +4341,6 @@ class LightningDTests(BaseLightningDTests):
         assert configs['bitcoin-datadir'] == bitcoind.bitcoin_dir
         assert configs['lightning-dir'] == l1.daemon.lightning_dir
         assert configs['allow-deprecated-apis'] is False
-        assert configs['override-fee-rates'] == '15000/7500/1000'
         assert configs['network'] == 'regtest'
         assert configs['ignore-fee-limits'] is False
 
@@ -4339,6 +4351,7 @@ class LightningDTests(BaseLightningDTests):
             oneconfig = l1.rpc.listconfigs(config=c)
             assert(oneconfig[c] == configs[c])
 
+    @unittest.skipIf(not DEVELOPER, "Too slow without --dev-bitcoind-poll")
     def test_multiple_channels(self):
         l1 = self.node_factory.get_node()
         l2 = self.node_factory.get_node()
@@ -4501,6 +4514,7 @@ class LightningDTests(BaseLightningDTests):
         l1.daemon.wait_for_log('Forgetting remote peer')
         bitcoind.generate_block(100)
         l1.daemon.wait_for_log('WIRE_ONCHAIN_ALL_IRREVOCABLY_RESOLVED')
+        l2.daemon.wait_for_log('WIRE_ONCHAIN_ALL_IRREVOCABLY_RESOLVED')
 
         # The only channel was closed, everybody should have forgotten the nodes
         assert l1.rpc.listnodes()['nodes'] == []
@@ -4613,6 +4627,43 @@ class LightningDTests(BaseLightningDTests):
         l1.start()
         l1.daemon.wait_for_log(r'Adding block 105')
         assert not l1.daemon.is_in_log(r'Adding block 102')
+
+    @unittest.skipIf(not DEVELOPER, "needs --dev-max-funding-unconfirmed-blocks")
+    def test_fundee_forget_funding_tx_unconfirmed(self):
+        """Test that fundee will forget the channel if
+        the funding tx has been unconfirmed for too long.
+        """
+        # Keep this low (default is 2016), since everything
+        # is much slower in VALGRIND mode and wait_for_log
+        # could time out before lightningd processes all the
+        # blocks.
+        blocks = 200
+        # funder
+        l1 = self.node_factory.get_node(fake_bitcoin_cli=True)
+        # fundee
+        l2 = self.node_factory.get_node(options={"dev-max-funding-unconfirmed-blocks": blocks})
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+
+        # Give funder some funds.
+        self.give_funds(l1, 10**7)
+        # Let blocks settle.
+        time.sleep(1)
+
+        # Prevent funder from broadcasting funding tx.
+        self.fake_bitcoind_fail(l1, 1)
+        # Fund the channel.
+        # The process will complete, but funder will be unable
+        # to broadcast and confirm funding tx.
+        l1.rpc.fundchannel(l2.info['id'], 10**6)
+        # Prevent l1 from timing out bitcoin-cli.
+        self.fake_bitcoind_unfail(l1)
+        # Generate blocks until unconfirmed.
+        bitcoind.generate_block(blocks)
+
+        # fundee will forget channel!
+        l2.daemon.wait_for_log('Forgetting channel: It has been {} blocks'.format(blocks))
+        # fundee will also forget and disconnect from peer.
+        assert len(l2.rpc.listpeers(l1.info['id'])['peers']) == 0
 
 
 if __name__ == '__main__':

@@ -20,14 +20,8 @@ struct config {
 	/* How long do we let them lock up our funds? (blocks) */
 	u32 locktime_max;
 
-	/* How many blocks before we expect to see anchor?. */
-	u32 anchor_onchain_wait;
-
 	/* How many confirms until we consider an anchor "settled". */
 	u32 anchor_confirms;
-
-	/* How long will we accept them waiting? */
-	u32 anchor_confirms_max;
 
 	/* Maximum percent of fee rate we'll accept. */
 	u32 commitment_fee_max_percent;
@@ -44,18 +38,12 @@ struct config {
 	/* Minimum CLTV if we're the final hop.*/
 	u32 cltv_final;
 
-	/* Maximum time for an expiring HTLC (blocks). */
-	u32 max_htlc_expiry;
-
 	/* Fee rates. */
 	u32 fee_base;
 	s32 fee_per_satoshi;
 
-	/* How long between polling bitcoind. */
-	struct timerel poll_time;
-
 	/* How long between changing commit and sending COMMIT message. */
-	struct timerel commit_time;
+	u32 commit_time_ms;
 
 	/* How often to broadcast gossip (msec) */
 	u32 broadcast_interval;
@@ -168,12 +156,13 @@ struct lightningd {
 	/* PID file */
 	char *pidfile;
 
-	/* May be useful for non-developers debugging in the field */
-	char *debug_subdaemon_io;
-
 	/* Initial autocleaninvoice settings. */
 	u64 ini_autocleaninvoice_cycle;
 	u64 ini_autocleaninvoice_expiredby;
+
+	/* Number of blocks we wait for a channel to get funded
+	 * if we are the fundee. */
+	u32 max_funding_unconfirmed;
 
 #if DEVELOPER
 	/* If we want to debug a subdaemon. */
@@ -206,5 +195,8 @@ struct backtrace_state *backtrace_state;
 
 /* Check we can run subdaemons, and check their versions */
 void test_daemons(const struct lightningd *ld);
+
+/* Notify lightningd about new blocks. */
+void notify_new_block(struct lightningd *ld, u32 block_height);
 
 #endif /* LIGHTNING_LIGHTNINGD_LIGHTNINGD_H */

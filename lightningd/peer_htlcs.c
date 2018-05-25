@@ -490,12 +490,12 @@ static void forward_htlc(struct htlc_in *hin,
 	 * 1. type: 21 (`expiry_too_far`)
 	 */
 	if (get_block_height(ld->topology)
-	    + ld->config.max_htlc_expiry < outgoing_cltv_value) {
+	    + ld->config.locktime_max < outgoing_cltv_value) {
 		log_debug(hin->key.channel->log,
 			  "Expiry cltv %u too far from current %u + max %u",
 			  outgoing_cltv_value,
 			  get_block_height(ld->topology),
-			  ld->config.max_htlc_expiry);
+			  ld->config.locktime_max);
 		failcode = WIRE_EXPIRY_TOO_FAR;
 		goto fail;
 	}
@@ -1514,7 +1514,7 @@ static u32 htlc_in_deadline(const struct lightningd *ld,
 	return hin->cltv_expiry - (ld->config.cltv_expiry_delta + 1)/2;
 }
 
-void notify_new_block(struct lightningd *ld, u32 height)
+void htlcs_notify_new_block(struct lightningd *ld, u32 height)
 {
 	bool removed;
 

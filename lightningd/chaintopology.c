@@ -16,6 +16,7 @@
 #include <common/timeout.h>
 #include <common/utils.h>
 #include <inttypes.h>
+#include <lightningd/channel_control.h>
 #include <lightningd/gossip_control.h>
 
 /* Mutual recursion via timer. */
@@ -24,7 +25,8 @@ static void try_extend_tip(struct chain_topology *topo);
 static void next_topology_timer(struct chain_topology *topo)
 {
 	/* This takes care of its own lifetime. */
-	notleak(new_reltimer(topo->timers, topo, topo->poll_time,
+	notleak(new_reltimer(topo->timers, topo,
+			     time_from_sec(topo->poll_seconds),
 			     try_extend_tip, topo));
 }
 
@@ -279,6 +281,13 @@ static void update_feerates(struct bitcoind *bitcoind,
 	for (size_t i = 0; i < NUM_FEERATES; i++) {
 		u32 feerate = satoshi_per_kw[i];
 
+		/* Takes into account override_fee_rate */
+		old_feerates[i] = get_feerate(topo, i);
+
+		/* If estimatefee failed, don't do anything. */
+		if (!feerate)
+			continue;
+
 		if (feerate < feerate_floor())
 			feerate = feerate_floor();
 
@@ -291,10 +300,10 @@ static void update_feerates(struct bitcoind *bitcoind,
 					  "...feerate %u hit floor %u",
 					  satoshi_per_kw[i], feerate);
 		}
-		old_feerates[i] = topo->feerate[i];
 		topo->feerate[i] = feerate;
 	}
 
+	/* Make sure fee rates are in order. */
 	for (size_t i = 0; i < NUM_FEERATES; i++) {
 		for (size_t j = 0; j < i; j++) {
 			if (topo->feerate[j] < topo->feerate[i]) {
@@ -305,7 +314,7 @@ static void update_feerates(struct bitcoind *bitcoind,
 				topo->feerate[j] = topo->feerate[i];
 			}
 		}
-		if (topo->feerate[i] != old_feerates[i])
+		if (get_feerate(topo, i) != old_feerates[i])
 			changed = true;
 	}
 
@@ -331,7 +340,8 @@ static void start_fee_estimate(struct chain_topology *topo)
 static void next_updatefee_timer(struct chain_topology *topo)
 {
 	/* This takes care of its own lifetime. */
-	notleak(new_reltimer(topo->timers, topo, topo->poll_time,
+	notleak(new_reltimer(topo->timers, topo,
+			     time_from_sec(topo->poll_seconds),
 			     start_fee_estimate, topo));
 }
 
@@ -586,10 +596,13 @@ static u32 guess_feerate(const struct chain_topology *topo, enum feerate feerate
 
 u32 get_feerate(const struct chain_topology *topo, enum feerate feerate)
 {
-	if (topo->override_fee_rate) {
+#if DEVELOPER
+	if (topo->dev_override_fee_rate) {
 		log_debug(topo->log, "Forcing fee rate, ignoring estimate");
-		return topo->override_fee_rate[feerate];
-	} else if (topo->feerate[feerate] == 0) {
+		return topo->dev_override_fee_rate[feerate];
+	}
+#endif
+	if (topo->feerate[feerate] == 0) {
 		return guess_feerate(topo, feerate);
 	}
 	return topo->feerate[feerate];
@@ -631,18 +644,18 @@ static void json_dev_setfees(struct command *cmd,
 		return;
 	}
 
-	if (!topo->override_fee_rate) {
+	if (!topo->dev_override_fee_rate) {
 		u32 fees[NUM_FEERATES];
 		for (size_t i = 0; i < ARRAY_SIZE(fees); i++)
 			fees[i] = get_feerate(topo, i);
-		topo->override_fee_rate = tal_dup_arr(topo, u32, fees,
-						      ARRAY_SIZE(fees), 0);
+		topo->dev_override_fee_rate = tal_dup_arr(topo, u32, fees,
+							  ARRAY_SIZE(fees), 0);
 	}
 	for (size_t i = 0; i < NUM_FEERATES; i++) {
 		if (!ratetok[i])
 			continue;
 		if (!json_tok_number(buffer, ratetok[i],
-				     &topo->override_fee_rate[i])) {
+				     &topo->dev_override_fee_rate[i])) {
 			command_fail(cmd, "Invalid feerate %.*s",
 				     ratetok[i]->end - ratetok[i]->start,
 				     buffer + ratetok[i]->start);
@@ -651,20 +664,20 @@ static void json_dev_setfees(struct command *cmd,
 	}
 	log_debug(topo->log,
 		  "dev-setfees: fees now %u/%u/%u",
-		  topo->override_fee_rate[FEERATE_IMMEDIATE],
-		  topo->override_fee_rate[FEERATE_NORMAL],
-		  topo->override_fee_rate[FEERATE_SLOW]);
+		  topo->dev_override_fee_rate[FEERATE_IMMEDIATE],
+		  topo->dev_override_fee_rate[FEERATE_NORMAL],
+		  topo->dev_override_fee_rate[FEERATE_SLOW]);
 
 	notify_feerate_change(cmd->ld);
 
 	response = new_json_result(cmd);
 	json_object_start(response, NULL);
 	json_add_num(response, "immediate",
-		     topo->override_fee_rate[FEERATE_IMMEDIATE]);
+		     topo->dev_override_fee_rate[FEERATE_IMMEDIATE]);
 	json_add_num(response, "normal",
-		     topo->override_fee_rate[FEERATE_NORMAL]);
+		     topo->dev_override_fee_rate[FEERATE_NORMAL]);
 	json_add_num(response, "slow",
-		     topo->override_fee_rate[FEERATE_SLOW]);
+		     topo->dev_override_fee_rate[FEERATE_SLOW]);
 	json_object_end(response);
 	command_success(cmd, response);
 }
@@ -717,19 +730,22 @@ struct chain_topology *new_topology(struct lightningd *ld, struct log *log)
 	txowatch_hash_init(&topo->txowatches);
 	topo->log = log;
 	topo->default_fee_rate = 40000;
-	topo->override_fee_rate = NULL;
+	memset(topo->feerate, 0, sizeof(topo->feerate));
 	topo->bitcoind = new_bitcoind(topo, ld, log);
 	topo->wallet = ld->wallet;
+	topo->poll_seconds = 30;
+#if DEVELOPER
+	topo->dev_override_fee_rate = NULL;
+#endif
 	return topo;
 }
 
 void setup_topology(struct chain_topology *topo,
 		    struct timers *timers,
-		    struct timerel poll_time, u32 first_blocknum)
+		    u32 first_blocknum)
 {
 	memset(&topo->feerate, 0, sizeof(topo->feerate));
 	topo->timers = timers;
-	topo->poll_time = poll_time;
 
 	topo->first_blocknum = first_blocknum;
 
