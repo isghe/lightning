@@ -1833,6 +1833,113 @@ static struct wireaddr_internal *setup_listeners(const tal_t *ctx,
 	return binding;
 }
 
+static void gossip_disable_outgoing_halfchan(struct routing_state *rstate,
+					     struct chan *chan)
+{
+	struct short_channel_id scid;
+	u8 direction;
+	struct half_chan *hc;
+	u16 flags, cltv_expiry_delta;
+	u32 timestamp, fee_base_msat, fee_proportional_millionths;
+	struct bitcoin_blkid chain_hash;
+	secp256k1_ecdsa_signature sig;
+	u64 htlc_minimum_msat;
+	u8 *err, *msg;
+
+	direction = pubkey_eq(&chan->nodes[0]->id, &rstate->local_id)?0:1;
+	assert(chan);
+	hc = &chan->half[direction];
+
+	if (!is_halfchan_defined(hc))
+		return;
+
+	status_trace("Disabling channel %s/%d, active %d -> %d",
+		     type_to_string(tmpctx, struct short_channel_id, &chan->scid),
+		     direction, is_halfchan_enabled(hc), 0);
+
+	if (!fromwire_channel_update(
+		hc->channel_update, &sig, &chain_hash, &scid, &timestamp,
+		&flags, &cltv_expiry_delta, &htlc_minimum_msat, &fee_base_msat,
+		&fee_proportional_millionths)) {
+		status_failed(
+		    STATUS_FAIL_INTERNAL_ERROR,
+		    "Unable to parse previously accepted channel_update");
+	}
+
+	/* Avoid sending gratuitous disable messages, e.g., on close and
+	 * subsequent disconnect */
+	if (flags & ROUTING_FLAGS_DISABLED)
+		return;
+
+	timestamp = time_now().ts.tv_sec;
+	if (timestamp <= hc->last_timestamp)
+		timestamp = hc->last_timestamp + 1;
+
+	flags = flags | ROUTING_FLAGS_DISABLED;
+
+	msg = towire_channel_update(tmpctx, &sig, &chain_hash, &scid, timestamp,
+				    flags, cltv_expiry_delta, htlc_minimum_msat,
+				    fee_base_msat, fee_proportional_millionths);
+
+	if (!wire_sync_write(HSM_FD,
+			     towire_hsm_cupdate_sig_req(tmpctx, msg))) {
+		status_failed(STATUS_FAIL_HSM_IO, "Writing cupdate_sig_req: %s",
+			      strerror(errno));
+	}
+
+	msg = wire_sync_read(tmpctx, HSM_FD);
+	if (!msg || !fromwire_hsm_cupdate_sig_reply(tmpctx, msg, &msg)) {
+		status_failed(STATUS_FAIL_HSM_IO,
+			      "Reading cupdate_sig_req: %s",
+			      strerror(errno));
+	}
+
+	err = handle_channel_update(rstate, msg, "disable_channel");
+	if (err)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "rejected disabling channel_update: %s",
+			      tal_hex(tmpctx, err));
+}
+
+/**
+ * Disable both directions of a local channel.
+ *
+ * Disables both directions of a local channel as a result of a close or lost
+ * connection. A disabling `channel_update` will be queued for the outgoing
+ * direction as well. We can't do that for the incoming direction, so we just
+ * locally flip the flag, and the other endpoint should take care of publicly
+ * disabling it with a `channel_update`.
+ *
+ * It is important to disable the incoming edge as well since we might otherwise
+ * return that edge as a `contact_point` as part of an invoice.
+ */
+static void gossip_disable_local_channel(struct routing_state *rstate,
+					 struct chan *chan)
+{
+	assert(pubkey_eq(&rstate->local_id, &chan->nodes[0]->id) ||
+	       pubkey_eq(&rstate->local_id, &chan->nodes[1]->id));
+
+	chan->half[0].flags |= ROUTING_FLAGS_DISABLED;
+	chan->half[1].flags |= ROUTING_FLAGS_DISABLED;
+	gossip_disable_outgoing_halfchan(rstate, chan);
+}
+
+static void gossip_disable_local_channels(struct daemon *daemon)
+{
+	struct node *local_node =
+	    get_node(daemon->rstate, &daemon->rstate->local_id);
+	size_t i;
+
+	/* We don't have a local_node, so we don't have any channels yet
+	 * either */
+	if (!local_node)
+		return;
+
+	for (i = 0; i < tal_count(local_node->chans); i++)
+		gossip_disable_local_channel(daemon->rstate,
+					     local_node->chans[i]);
+}
+
 /* Parse an incoming gossip init message and assign config variables
  * to the daemon.
  */
@@ -1871,6 +1978,10 @@ static struct io_plan *gossip_init(struct daemon_conn *master,
 
 	/* Load stored gossip messages */
 	gossip_store_load(daemon->rstate, daemon->rstate->store);
+
+	/* Now disable all local channels, they can't be connected yet. */
+	gossip_disable_local_channels(daemon);
+
 
 	new_reltimer(&daemon->timers, daemon,
 		     time_from_sec(daemon->rstate->prune_timeout/4),
@@ -2355,11 +2466,23 @@ static struct io_plan *peer_important(struct io_conn *conn,
 	return daemon_conn_read_next(conn, &daemon->master);
 }
 
+static void peer_disable_channels(struct routing_state *rstate, struct node *node)
+{
+	struct chan *c;
+	size_t i;
+	for (i=0; i<tal_count(node->chans); i++) {
+		c = node->chans[i];
+		if (pubkey_eq(&other_node(node, c)->id, &rstate->local_id))
+			gossip_disable_local_channel(rstate, c);
+	}
+}
+
 static struct io_plan *peer_disconnected(struct io_conn *conn,
 					 struct daemon *daemon, const u8 *msg)
 {
 	struct pubkey id;
 	struct peer *peer;
+	struct node *node;
 
 	if (!fromwire_gossipctl_peer_disconnected(msg, &id))
 		master_badmsg(WIRE_GOSSIPCTL_PEER_DISCONNECTED, msg);
@@ -2374,6 +2497,11 @@ static struct io_plan *peer_disconnected(struct io_conn *conn,
 
 	status_trace("Forgetting remote peer %s",
 		     type_to_string(tmpctx, struct pubkey, &peer->id));
+
+	/* Disable any channels to and from this peer */
+	node = get_node(daemon->rstate, &id);
+	if (node)
+		peer_disable_channels(daemon->rstate, node);
 
 	tal_free(peer);
 
@@ -2440,91 +2568,6 @@ static struct io_plan *handle_txout_reply(struct io_conn *conn,
 	return daemon_conn_read_next(conn, &daemon->master);
 }
 
-static struct io_plan *handle_disable_channel(struct io_conn *conn,
-					      struct daemon *daemon, u8 *msg)
-{
-	struct short_channel_id scid;
-	u8 direction;
-	struct chan *chan;
-	struct half_chan *hc;
-	bool active;
-	u16 flags, cltv_expiry_delta;
-	u32 timestamp, fee_base_msat, fee_proportional_millionths;
-	struct bitcoin_blkid chain_hash;
-	secp256k1_ecdsa_signature sig;
-	u64 htlc_minimum_msat;
-	u8 *err;
-
-	if (!fromwire_gossip_disable_channel(msg, &scid, &direction, &active) ) {
-		status_unusual("Unable to parse %s",
-			      gossip_wire_type_name(fromwire_peektype(msg)));
-		goto fail;
-	}
-
-	chan = get_channel(daemon->rstate, &scid);
-	if (!chan) {
-		status_trace(
-		    "Unable to find channel %s",
-		    type_to_string(msg, struct short_channel_id, &scid));
-		goto fail;
-	}
-	hc = &chan->half[direction];
-
-	status_trace("Disabling channel %s/%d, active %d -> %d",
-		     type_to_string(msg, struct short_channel_id, &scid),
-		     direction, is_halfchan_enabled(hc), active);
-
-	if (!is_halfchan_defined(hc)) {
-		status_trace(
-		    "Channel %s/%d doesn't have a channel_update yet, can't "
-		    "disable",
-		    type_to_string(msg, struct short_channel_id, &scid),
-		    direction);
-		goto fail;
-	}
-
-	if (!fromwire_channel_update(
-		hc->channel_update, &sig, &chain_hash, &scid, &timestamp,
-		&flags, &cltv_expiry_delta, &htlc_minimum_msat, &fee_base_msat,
-		&fee_proportional_millionths)) {
-		status_failed(
-		    STATUS_FAIL_INTERNAL_ERROR,
-		    "Unable to parse previously accepted channel_update");
-	}
-
-	timestamp = time_now().ts.tv_sec;
-	if (timestamp <= hc->last_timestamp)
-		timestamp = hc->last_timestamp + 1;
-
-	/* Active is bit 1 << 1, mask and apply */
-	flags = (0xFFFD & flags) | (!active << 1);
-
-	msg = towire_channel_update(tmpctx, &sig, &chain_hash, &scid, timestamp,
-				    flags, cltv_expiry_delta, htlc_minimum_msat,
-				    fee_base_msat, fee_proportional_millionths);
-
-	if (!wire_sync_write(HSM_FD,
-			     towire_hsm_cupdate_sig_req(tmpctx, msg))) {
-		status_failed(STATUS_FAIL_HSM_IO, "Writing cupdate_sig_req: %s",
-			      strerror(errno));
-	}
-
-	msg = wire_sync_read(tmpctx, HSM_FD);
-	if (!msg || !fromwire_hsm_cupdate_sig_reply(tmpctx, msg, &msg)) {
-		status_failed(STATUS_FAIL_HSM_IO,
-			      "Reading cupdate_sig_req: %s",
-			      strerror(errno));
-	}
-
-	err = handle_channel_update(daemon->rstate, msg, "disable_channel");
-	if (err)
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "rejected disabling channel_update: %s",
-			      tal_hex(tmpctx, err));
-
-fail:
-	return daemon_conn_read_next(conn, &daemon->master);
-}
 static struct io_plan *handle_routing_failure(struct io_conn *conn,
 					      struct daemon *daemon,
 					      const u8 *msg)
@@ -2591,6 +2634,31 @@ static struct io_plan *handle_outpoint_spent(struct io_conn *conn,
 	return daemon_conn_read_next(conn, &daemon->master);
 }
 
+/**
+ * Disable both directions of a channel due to an imminent close.
+ *
+ * We'll leave it to handle_outpoint_spent to delete the channel from our view
+ * once the close gets confirmed. This avoids having strange states in which the
+ * channel is list in our peer list but won't be returned when listing public
+ * channels. This does not send out updates since that's triggered by the peer
+ * connection closing.
+ */
+static struct io_plan *handle_local_channel_close(struct io_conn *conn,
+						  struct daemon *daemon,
+						  const u8 *msg)
+{
+	struct short_channel_id scid;
+	struct chan *chan;
+	struct routing_state *rstate = daemon->rstate;
+	if (!fromwire_gossip_local_channel_close(msg, &scid))
+		master_badmsg(WIRE_GOSSIP_ROUTING_FAILURE, msg);
+
+	chan = get_channel(rstate, &scid);
+	if (chan)
+		gossip_disable_local_channel(rstate, chan);
+	return daemon_conn_read_next(conn, &daemon->master);
+}
+
 static struct io_plan *recv_req(struct io_conn *conn, struct daemon_conn *master)
 {
 	struct daemon *daemon = container_of(master, struct daemon, master);
@@ -2642,9 +2710,6 @@ static struct io_plan *recv_req(struct io_conn *conn, struct daemon_conn *master
 	case WIRE_GOSSIP_GET_TXOUT_REPLY:
 		return handle_txout_reply(conn, daemon, master->msg_in);
 
-	case WIRE_GOSSIP_DISABLE_CHANNEL:
-		return handle_disable_channel(conn, daemon, master->msg_in);
-
 	case WIRE_GOSSIP_ROUTING_FAILURE:
 		return handle_routing_failure(conn, daemon, master->msg_in);
 
@@ -2656,6 +2721,9 @@ static struct io_plan *recv_req(struct io_conn *conn, struct daemon_conn *master
 
 	case WIRE_GOSSIP_OUTPOINT_SPENT:
 		return handle_outpoint_spent(conn, daemon, master->msg_in);
+
+	case WIRE_GOSSIP_LOCAL_CHANNEL_CLOSE:
+		return handle_local_channel_close(conn, daemon, master->msg_in);
 
 	/* We send these, we don't receive them */
 	case WIRE_GOSSIPCTL_ACTIVATE_REPLY:

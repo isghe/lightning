@@ -2505,10 +2505,10 @@ class LightningDTests(BaseLightningDTests):
         too.
         """
         opts = {'dev-no-reconnect': None}
-        l1 = self.node_factory.get_node(options=opts)
-        l2 = self.node_factory.get_node(options=opts)
-        l3 = self.node_factory.get_node(options=opts)
-        l4 = self.node_factory.get_node(options=opts)
+        l1 = self.node_factory.get_node(options=opts, may_reconnect=True)
+        l2 = self.node_factory.get_node(options=opts, may_reconnect=True)
+        l3 = self.node_factory.get_node(options=opts, may_reconnect=True)
+        l4 = self.node_factory.get_node(options=opts, may_reconnect=True)
 
         l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
         l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
@@ -2532,8 +2532,14 @@ class LightningDTests(BaseLightningDTests):
         wait_for(lambda: count_active(l2) == 4)
         wait_for(lambda: count_active(l3) == 6)  # 4 public + 2 local
 
-        # l1 restarts and doesn't connect, but loads from persisted store
+        # l1 restarts and doesn't connect, but loads from persisted store, all
+        # local channels should be disabled, leaving only the two l2 <-> l3
+        # directions
         l1.restart()
+        wait_for(lambda: count_active(l1) == 2)
+
+        # Now reconnect, they should re-enable the two l1 <-> l2 directions
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
         wait_for(lambda: count_active(l1) == 4)
 
         # Now spend the funding tx, generate a block and see others deleting the
@@ -2563,6 +2569,8 @@ class LightningDTests(BaseLightningDTests):
         # Finally, it should also remember the deletion after a restart
         l3.restart()
         l4.restart()
+        l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
+        l3.rpc.connect(l4.info['id'], 'localhost', l4.port)
         wait_for(lambda: count_active(l3) == 4)  # 2 public + 2 local
 
         # Both l3 and l4 should remember their local-only channel
@@ -2663,14 +2671,20 @@ class LightningDTests(BaseLightningDTests):
             comb.append((nodes[i].info['id'], nodes[i + 1].info['id']))
             comb.append((nodes[i + 1].info['id'], nodes[i].info['id']))
 
+        def check_gossip(n):
+            seen = []
+            channels = n.rpc.listchannels()['channels']
+            for c in channels:
+                seen.append((c['source'], c['destination']))
+            missing = set(comb) - set(seen)
+            logging.debug("Node {id} is missing channels {chans}".format(
+                id=n.info['id'],
+                chans=missing)
+            )
+            return len(missing) == 0
+
         for n in nodes:
-            def check_gossip():
-                seen = []
-                channels = n.rpc.listchannels()['channels']
-                for c in channels:
-                    seen.append((c['source'], c['destination']))
-                return set(seen) == set(comb)
-            wait_for(check_gossip)
+            wait_for(lambda: check_gossip(n), interval=1)
 
     @unittest.skipIf(not DEVELOPER, "Too slow without --dev-bitcoind-poll")
     def test_forward(self):
@@ -3851,7 +3865,8 @@ class LightningDTests(BaseLightningDTests):
         assert l2.rpc.listinvoices('inv1')['invoices'][0]['status'] == 'paid'
 
         # FIXME: We should re-add pre-announced routes on startup!
-        self.wait_for_routes(l1, [chanid])
+        l1.bitcoin.rpc.generate(5)
+        l1.wait_channel_active(chanid)
 
         # A duplicate should succeed immediately (nop) and return correct preimage.
         preimage = l1.rpc.pay(inv1['bolt11'])['payment_preimage']
