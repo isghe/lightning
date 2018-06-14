@@ -462,6 +462,13 @@ static void dev_register_opts(struct lightningd *ld)
 	opt_register_arg("--dev-bitcoind-poll", opt_set_u32, opt_show_u32,
 			 &ld->topology->poll_seconds,
 			 "Time between polling for new transactions");
+	opt_register_arg("--dev-max-fee-multiplier", opt_set_u32, opt_show_u32,
+			 &ld->config.max_fee_multiplier,
+			 "Allow the fee proposed by the remote end to be up to "
+			 "multiplier times higher than our own. Small values "
+			 "will cause channels to be closed more often due to "
+			 "fee fluctuations, large values may result in large "
+			 "fees.");
 	opt_register_arg("--dev-override-fee-rates", opt_set_fee_rates, NULL,
 			 ld->topology,
 			 "Force a specific rates (immediate/normal/slow) in satoshis per kw regardless of estimated fees");
@@ -477,8 +484,9 @@ static const struct config testnet_config = {
 	/* 6 blocks to catch cheating attempts. */
 	.locktime_blocks = 6,
 
-	/* They can have up to 5 days. */
-	.locktime_max = 5 * 6 * 24,
+	/* They can have up to 14 days, maximumu value that lnd will ask for by default. */
+	/* FIXME Convince lnd to use more reasonable defaults... */
+	.locktime_max = 14 * 6 * 24,
 
 	/* We're fairly trusting, under normal circumstances. */
 	.anchor_confirms = 1,
@@ -514,6 +522,9 @@ static const struct config testnet_config = {
 
 	/* Rescan 5 hours of blocks on testnet, it's reorg happy */
 	.rescan = 30,
+
+	/* Fees may be in the range our_fee - 10*our_fee */
+	.max_fee_multiplier = 10,
 };
 
 /* aka. "Dude, where's my coins?" */
@@ -521,8 +532,9 @@ static const struct config mainnet_config = {
 	/* ~one day to catch cheating attempts. */
 	.locktime_blocks = 6 * 24,
 
-	/* They can have up to 5 days. */
-	.locktime_max = 5 * 6 * 24,
+	/* They can have up to 14 days, maximumu value that lnd will ask for by default. */
+	/* FIXME Convince lnd to use more reasonable defaults... */
+	.locktime_max = 14 * 6 * 24,
 
 	/* We're fairly trusting, under normal circumstances. */
 	.anchor_confirms = 3,
@@ -566,6 +578,9 @@ static const struct config mainnet_config = {
 
 	/* Rescan 2.5 hours of blocks on startup, it's not so reorg happy */
 	.rescan = 15,
+
+	/* Fees may be in the range our_fee - 10*our_fee */
+	.max_fee_multiplier = 10,
 };
 
 static void check_config(struct lightningd *ld)

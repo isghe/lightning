@@ -470,6 +470,16 @@ class LightningNode(object):
         decoded2 = self.bitcoin.rpc.decoderawtransaction(tx)
         raise ValueError("Can't find {} payment in {} (1={} 2={})".format(amount, tx, decoded, decoded2))
 
+    def subd_pid(self, subd):
+        """Get the process id of the given subdaemon, eg channeld or gossipd"""
+        ex = re.compile(r'lightning_{}.*: pid ([0-9]*),'.format(subd))
+        # Make sure we get latest one if it's restarted!
+        for l in reversed(self.daemon.logs):
+            group = ex.search(l)
+            if group:
+                return group.group(1)
+        raise ValueError("No daemon {} found".format(subd))
+
     def is_channel_active(self, chanid):
         channels = self.rpc.listchannels()['channels']
         active = [(c['short_channel_id'], c['flags']) for c in channels if c['active']]
