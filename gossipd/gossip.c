@@ -353,7 +353,7 @@ new_local_peer_state(struct peer *peer, const struct crypto_state *cs)
 	lps->pcs.cs = *cs;
 	lps->return_to_master = false;
 	lps->num_pings_outstanding = 0;
-	msg_queue_init(&lps->peer_out, peer);
+	msg_queue_init(&lps->peer_out, lps);
 
 	return lps;
 }
@@ -506,6 +506,9 @@ static void queue_peer_msg(struct peer *peer, const u8 *msg TAKES)
 		if (taken(msg))
 			tal_free(msg);
 		daemon_conn_send(peer->remote, take(send));
+	} else { /* Waiting to die. */
+		if (taken(msg))
+			tal_free(msg);
 	}
 }
 
@@ -650,16 +653,16 @@ static struct io_plan *peer_connected(struct io_conn *conn, struct peer *peer)
 				= peer->daemon->rstate->broadcasts->next_index;
 	}
 
-	/* This is a full peer now; we keep it around until master says
-	 * it's dead. */
-	peer_finalized(peer);
-
 	/* We will not have anything queued, since we're not duplex. */
 	msg = towire_gossip_peer_connected(peer, &peer->id, &peer->addr,
 					   &peer->local->pcs.cs,
 					   peer->gfeatures, peer->lfeatures);
 	if (!send_peer_with_fds(peer, msg))
 		return io_close(conn);
+
+	/* This is a full peer now; we keep it around until master says
+	 * it's dead. */
+	peer_finalized(peer);
 
 	/* Start the gossip flowing. */
 	wake_gossip_out(peer);
@@ -1558,7 +1561,10 @@ static struct io_plan *peer_pkt_out(struct io_conn *conn, struct peer *peer)
 	/* First priority is queued packets, if any */
 	const u8 *out;
 
+	assert(peer->local);
 again:
+	/* Second assert may trigger if something happens due to loop */
+	assert(peer->local);
 	out = msg_dequeue(&peer->local->peer_out);
 	if (out) {
 		if (is_all_channel_error(out))
@@ -1865,6 +1871,8 @@ static bool nonlocal_dump_gossip(struct io_conn *conn, struct daemon_conn *dc)
 
 static struct io_plan *new_peer_got_fd(struct io_conn *conn, struct peer *peer)
 {
+	struct daemon *daemon = peer->daemon;
+
 	peer->local->conn = io_new_conn(conn, peer->local->fd,
 					peer_start_gossip, peer);
 	if (!peer->local->conn) {
@@ -1875,7 +1883,7 @@ static struct io_plan *new_peer_got_fd(struct io_conn *conn, struct peer *peer)
 		/* If conn dies, we forget peer. */
 		tal_steal(peer->local->conn, peer);
 	}
-	return daemon_conn_read_next(conn, &peer->daemon->master);
+	return daemon_conn_read_next(conn, &daemon->master);
 }
 
 /* This lets us read the fds in before handling anything. */
@@ -3136,7 +3144,7 @@ static void try_reach_peer(struct daemon *daemon, const struct pubkey *id,
 			status_failed(STATUS_FAIL_MASTER_IO,
 				      "Already reaching %s",
 				      type_to_string(tmpctx, struct pubkey, id));
-		reach->master_needs_response = true;
+		reach->master_needs_response = master_needs_response;
 		return;
 	}
 
